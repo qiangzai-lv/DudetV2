@@ -1,31 +1,24 @@
 # Copyright (c) OpenMMLab. All rights reserved.
+from functools import partial
 from typing import List, Tuple
 
 import torch
+import torch.nn.functional as F
 from mmcv.cnn import Scale
-from mmcv.ops import nms3d, nms3d_normal
 from mmdet.models.utils import multi_apply
-from mmdet.utils import reduce_mean
 # from mmengine.config import ConfigDict
-from mmengine.model import BaseModule, bias_init_with_prob, normal_init
+from mmengine.model import BaseModule
 from mmengine.structures import InstanceData
+from scipy.optimize import linear_sum_assignment
 from torch import Tensor, nn
 
 from mmdet3d.registry import MODELS, TASK_UTILS
-from mmdet3d.structures.bbox_3d.utils import rotation_3d_in_axis
 from mmdet3d.structures.det3d_data_sample import SampleList
+from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
 from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
-from functools import partial
 from projects.Dudet.detr3_models.helpers import GenericMLP
-from projects.Dudet.detr3_models.utils.box_util import get_3d_box_batch_depth_tensor, generalized_box3d_iou
-from scipy.optimize import linear_sum_assignment
-import torch.nn.functional as F
-
-import time
-from projects.Dudet.detr3_models.utils.votenet_pc_util import write_oriented_bbox, write_ply, write_ply_rgb, write_bbox
-from mmdet3d.structures.ops.iou3d_calculator import axis_aligned_bbox_overlaps_3d
-
+from projects.Dudet.detr3_models.utils.votenet_pc_util import write_ply_rgb, write_bbox
 
 
 @torch.no_grad()
