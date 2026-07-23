@@ -6,7 +6,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from mmdet3d.models.detectors import Base3DDetector
-from mmdet3d.registry import MODELS, TASK_UTILS
+from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 
@@ -135,37 +135,11 @@ class ChannelProjecter(nn.Module):
 class VGGTDet(Base3DDetector):
     def __init__(
             self,
-            backbone: ConfigType,
-            neck: ConfigType,
-            neck_3d: ConfigType,
             bbox_head: ConfigType,
-            prior_generator: ConfigType,
-            n_voxels: List,
-            voxel_size: List,
-            head_2d: ConfigType = None,
             train_cfg: OptConfigType = None,
             test_cfg: OptConfigType = None,
             data_preprocessor: OptConfigType = None,
             init_cfg: OptConfigType = None,
-            #  pretrained,
-            aabb: Tuple = None,
-            near_far_range: List = None,
-            N_samples: int = 64,
-            N_rand: int = 2048,
-            depth_supervise: bool = False,
-            use_nerf_mask: bool = True,
-            nerf_sample_view: int = 3,
-            nerf_mode: str = 'volume',
-            squeeze_scale: int = 4,
-            rgb_supervision: bool = True,
-            nerf_density: bool = False,
-            render_testing: bool = False,
-            gs_cfg=None,
-            vis_dir=None,
-            visualize_bbox = False,
-            topk=3,
-            alpha_thres=None,
-            sigma_w=0.5,
             decoder_cfg: OptConfigType = None,
             if_learnable_query=True,
             num_queries=128,
@@ -174,7 +148,6 @@ class VGGTDet(Base3DDetector):
             if_use_gt_query=False,
             position_embedding="fourier",
             if_mix_precision=False,
-            if_save_vggt_feature=False,
             use_multi_layers=False,
             if_simpler_project=False,
             if_use_pred_pc_query=False,
@@ -265,8 +238,6 @@ class VGGTDet(Base3DDetector):
             else:
                 self.proj_feat_dim = ChannelProjecter(in_channels=2048, out_channels=token_dim)
 
-        self.prior_generator = TASK_UTILS.build(prior_generator)
-
         self.train_cfg = train_cfg
         self.test_cfg = test_cfg
 
@@ -307,7 +278,6 @@ class VGGTDet(Base3DDetector):
                 hidden_use_bias=True,
             )
         self.if_mix_precision = if_mix_precision
-        self.if_save_vggt_feature = if_save_vggt_feature
 
         self.use_multi_layers = use_multi_layers
         self.if_use_atten_sample = if_use_atten_sample
@@ -333,11 +303,6 @@ class VGGTDet(Base3DDetector):
             with torch.cuda.amp.autocast(dtype=vggt_dtype):
                 img = batch_inputs_dict['imgs'] # (bs, 40, 3, 392, 518)
                 img = img.float()
-                batch_img_metas = [
-                    data_samples.metainfo for data_samples in batch_data_samples
-                ]
-                batch_size = img.shape[0]
-                # img = torch.ones_like(img)
                 if self.if_use_atten_sample or self.if_use_atten_fps:
                     aggregated_tokens_list, ps_idx, images_patch_attn = self.vggt_encoder.aggregator(img, if_norm=False, if_detach=True, 
                                                                                                      if_only_last_layer=(not self.use_multi_layers), 
@@ -351,9 +316,6 @@ class VGGTDet(Base3DDetector):
                                                                                   if_use_atten_sample=False,
                                                                                   if_task_query=self.if_task_query) 
                     return aggregated_tokens_list, ps_idx, img, None
-                # aggregated_tokens_list
-                
-                
 
 
 
@@ -379,7 +341,6 @@ class VGGTDet(Base3DDetector):
 
     @torch.no_grad()
     def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images, batch_inputs_dict, images_patch_attn):
-        # assert self.vggt_encoder.training==False
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=vggt_dtype): 
@@ -399,26 +360,6 @@ class VGGTDet(Base3DDetector):
                 depth_map, depth_conf = self.vggt_encoder.depth_head(aggregated_tokens_list, images, ps_idx)
                 del aggregated_tokens_list
 
-                # point_map_by_unprojection = unproject_depth_map_to_point_map(depth_map[9], 
-                #                                                 extrinsic[9], 
-                #                                                 intrinsic[9])
-
-                # point_map_by_unprojection = point_map_by_unprojection.reshape(-1, point_map_by_unprojection.shape[-1])[np.newaxis, :, :]  
-
-
-                # point_map_by_unprojection2 = unproject_depth_map_to_point_map(depth_map[3], 
-                #                                                 extrinsic[3], 
-                #                                                 intrinsic[3])
-
-                # point_map_by_unprojection2 = point_map_by_unprojection2.reshape(-1, point_map_by_unprojection.shape[-1])[np.newaxis, :, :]  
-
-
-                # point_map_by_unprojection3 = unproject_depth_map_to_point_map(depth_map[12], 
-                #                                                 extrinsic[12],
-                #                                                 intrinsic[12])
-
-                # point_map_by_unprojection3 = point_map_by_unprojection3.reshape(-1, point_map_by_unprojection.shape[-1])[np.newaxis, :, :]  
-
                 assert depth_map.shape[-1] == 1
                 depth_map = depth_map.squeeze(-1)
                 
@@ -430,11 +371,7 @@ class VGGTDet(Base3DDetector):
 
                     bs, num_frame, h, w  = depth_map.shape
 
-                    # # use depth 
                     depth_mask = depth_map > self.depth_thres  # shape [10, 40, 336, 448]
-                    # mask_expanded = depth_mask.unsqueeze(-1).expand(-1, -1, -1, -1, 3)
-                    # mask_expanded = mask_expanded.reshape(point_map_by_unprojection_tensor.shape[0], point_map_by_unprojection_tensor.shape[1], -1 ,point_map_by_unprojection_tensor.shape[-1])
-                    # point_map_by_unprojection_tensor = point_map_by_unprojection_tensor[mask_expanded]
 
                     patch_size = self.vggt_encoder.aggregator.patch_size
 
@@ -463,9 +400,6 @@ class VGGTDet(Base3DDetector):
                     num_point = prob_dist_pre.shape[-1] # (bs*num_frame, h*w)
                     prob_dist = prob_dist_pre / prob_dist_pre.sum(dim=-1, keepdim=True)
                     num_samples = int(num_point / self.atten_sample_ratio)
-
-                    # sampled_indices = torch.multinomial(prob_dist, num_samples, replacement=False)
-
                     topk_values, sampled_indices = torch.topk(prob_dist, num_samples, dim=1)
 
 
@@ -475,13 +409,10 @@ class VGGTDet(Base3DDetector):
                     del norm_attn_img_up, attn_img_up, attn_reshape, prob_dist_pre, prob_dist
                     sampled_point_map_by_unprojection_tensor = torch.gather(point_map_by_unprojection_tensor, dim=2, index=expanded_indices)
                     sampled_point_map_by_unprojection_tensor = sampled_point_map_by_unprojection_tensor.reshape(sampled_point_map_by_unprojection_tensor.shape[0], -1, sampled_point_map_by_unprojection_tensor.shape[-1])
-                    # print(1)
                     sampled_point_map_by_unprojection_tensor = self.batch_random_sample(sampled_point_map_by_unprojection_tensor, 100000)
 
                     del extrinsic, intrinsic, depth_map, depth_conf, pose_enc 
 
-                    # print(1)
-                    # sampled_point_map_by_unprojection_tensor = self.batch_atten_sample(point_map_by_unprojection_tensor, images_patch_attn)
                 elif self.if_use_atten_fps:
                     images_patch_attn = images_patch_attn.float() 
 
@@ -492,10 +423,6 @@ class VGGTDet(Base3DDetector):
 
                     # # use depth 
                     depth_mask = depth_map > self.depth_thres  # shape [10, 40, 336, 448]
-                    # mask_expanded = depth_mask.unsqueeze(-1).expand(-1, -1, -1, -1, 3)
-                    # mask_expanded = mask_expanded.reshape(point_map_by_unprojection_tensor.shape[0], point_map_by_unprojection_tensor.shape[1], -1 ,point_map_by_unprojection_tensor.shape[-1])
-                    # point_map_by_unprojection_tensor = point_map_by_unprojection_tensor[mask_expanded]
-
                     patch_size = self.vggt_encoder.aggregator.patch_size
 
                     attn_reshape = images_patch_attn.view(bs, num_frame, h//patch_size, w//patch_size)
@@ -526,21 +453,8 @@ class VGGTDet(Base3DDetector):
                     
                     prob_dist = prob_dist.view(bs, -1)
 
-                    # point_map_by_unprojection_tensor = point_map_by_unprojection_tensor.view(bs, -1, point_map_by_unprojection_tensor.shape[-1])
-                    # sampled_indices = torch.multinomial(prob_dist, num_samples, replacement=False)
-
-                    # topk_values, sampled_indices = torch.topk(prob_dist, num_samples, dim=1)
-
-
-                    # sampled_indices = sampled_indices.view(bs, num_frame, num_samples)
-                    # expanded_indices = sampled_indices.unsqueeze(-1).expand(-1, -1, -1, 3)
-
                     del norm_attn_img_up, attn_img_up, attn_reshape, prob_dist_pre
-                    # sampled_point_map_by_unprojection_tensor = torch.gather(point_map_by_unprojection_tensor, dim=2, index=expanded_indices)
-                    # sampled_point_map_by_unprojection_tensor = sampled_point_map_by_unprojection_tensor.reshape(sampled_point_map_by_unprojection_tensor.shape[0], -1, sampled_point_map_by_unprojection_tensor.shape[-1])
-                    # print(1)
-                    # depth_mask = depth_map > self.depth_thres
-                    # depth_mask = depth_mask.reshape(point_map_by_unprojection_tensor.shape[0], -1)
+
                     sampled_point_map_by_unprojection_tensor, atten_weights = self.batch_random_sample(point_map_by_unprojection_tensor, 100000, weights=prob_dist)
 
                     del extrinsic, intrinsic, depth_map, depth_conf, pose_enc, prob_dist
@@ -552,9 +466,6 @@ class VGGTDet(Base3DDetector):
                     depth_mask = depth_mask.reshape(point_map_by_unprojection_tensor.shape[0], -1)
 
                     del extrinsic, intrinsic, depth_map, depth_conf, pose_enc 
-                    # Predict Tracks
-                    # choose your own points to track, with shape (N, 2) for one scene
-                # assert np.sum(np.abs((point_map_by_unprojection.astype(np.float32) - point_map_by_unprojection_tensor.cpu().numpy())) > 1e-6) == 0
 
                     sampled_point_map_by_unprojection_tensor = self.batch_random_sample(point_map_by_unprojection_tensor, 100000, depth_mask)
 
@@ -571,10 +482,6 @@ class VGGTDet(Base3DDetector):
 
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict, images, images_patch_attn):
-        # patch_tokens_last_layer = tokens_last_layer[:, :, ps_idx:, :] 
-
-        # x = self.proj_feat_dim(x)
-        
 
         if self.use_multi_layers:
             x = []
@@ -600,7 +507,6 @@ class VGGTDet(Base3DDetector):
                 patch_tokens_projected = patch_tokens_projected.permute(2, 0, 1).contiguous() 
                 x.append(patch_tokens_projected)
 
-            # patch_tokens_cat = torch.cat(patch_tokens_list, dim=-1)  # [B, N, T, C*4]
             if not self.if_use_pred_pc_query:
                 del vggt_token_list
             
@@ -619,15 +525,9 @@ class VGGTDet(Base3DDetector):
             query_xyz, query_embed = self.get_query_embeddings(points_xyz, point_cloud_dims=None) # query_xyz shape: [4, 256, 3], query_embed: [4, 1024, 256]
             query_embed = query_embed.permute(2, 0, 1) # query_embed: [256, 4, 1024]
             tgt = torch.zeros((self.num_queries, batch_size, feat_dim), device=query_xyz.device)
-
-            # x = self.proj_norm(x) 
-            # print(1)
-            # tgt = torch.zeros_like(query_embed)
             box_features = self.decoder(tgt, x, query_pos=query_embed, pos=None)[0]
             batch_inputs_dict['query_xyz'] = query_xyz
         elif self.if_use_pred_pc_query:
-            # points_xyz = torch.stack(batch_inputs_dict['points'], dim=0)[:, :, :3].contiguous()
-            # write_ply(points_xyz[0], 'vis_pc/1_gt_pc.ply')
             pred_pc, atten_weights = self.pred_pc_from_vggt(vggt_token_list, ps_idx, images, batch_inputs_dict, images_patch_attn)
             if self.if_add_noises:
                 pred_pc = self.add_normalized_noise_to_point_cloud(pred_pc, self.noise_level)
@@ -635,8 +535,6 @@ class VGGTDet(Base3DDetector):
                 query_xyz, query_embed = self.get_query_embeddings_atten_fps(pred_pc, point_cloud_dims=None, atten_weights=atten_weights)
             else:
                 query_xyz, query_embed = self.get_query_embeddings(pred_pc, point_cloud_dims=None) # query_xyz shape: [4, 256, 3], query_embed: [4, 1024, 256]
-
-
 
             query_embed = query_embed.permute(2, 0, 1) # query_embed: [256, 4, 1024]
             tgt = torch.zeros((self.num_queries, batch_size, feat_dim), device=query_xyz.device)
@@ -646,19 +544,10 @@ class VGGTDet(Base3DDetector):
                 tgt = torch.cat([tgt, expanded_task_query], dim=0)  # [num_queries+1, bs, feat_dim]
             ######### idea 2 ############
 
-            # x = self.proj_norm(x) 
-            # print(1)
-            # tgt = torch.zeros_like(query_embed)
             box_features = self.decoder(tgt, x, query_pos=query_embed, pos=None, if_task_query=self.if_task_query)[0]
             batch_inputs_dict['query_xyz'] = query_xyz
-            # write_ply(pred_pc[0], 'vis_pc/1_pred_pc.ply')
-            # print(1)
         else:
             tgt = self.queries.unsqueeze(1).expand(-1, batch_size, -1) # [num_queries, batch_size, token_dim]
-            # x = x.reshape(batch_size, feat_dim, -1)
-            # x = self.proj_norm(x) 
-            # print(1)
-            # tgt = torch.zeros_like(query_embed)
             box_features = self.decoder(tgt, x, query_pos=None, pos=None)[0]
 
         return box_features
@@ -713,7 +602,6 @@ class VGGTDet(Base3DDetector):
             box_features = [box_features[-1]]
 
         results_list = self.bbox_head.predict(box_features, batch_data_samples, batch_inputs_dict, **kwargs)
-        # results_list[0]['labels_3d'] = torch.ones_like(results_list[0]['labels_3d']) * 2
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
@@ -741,11 +629,6 @@ class VGGTDet(Base3DDetector):
         query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
         query_xyz = torch.stack(query_xyz)
         query_xyz = query_xyz.permute(1, 2, 0)
-
-        # Gater op above can be replaced by the three lines below from the pointnet2 codebase
-        # xyz_flipped = encoder_xyz.transpose(1, 2).contiguous()
-        # query_xyz = gather_operation(xyz_flipped, query_inds.int())
-        # query_xyz = query_xyz.transpose(1, 2)
         pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)
         query_embed = self.query_projection(pos_embed)
         return query_xyz, query_embed
@@ -756,11 +639,6 @@ class VGGTDet(Base3DDetector):
         query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
         query_xyz = torch.stack(query_xyz)
         query_xyz = query_xyz.permute(1, 2, 0)
-
-        # Gater op above can be replaced by the three lines below from the pointnet2 codebase
-        # xyz_flipped = encoder_xyz.transpose(1, 2).contiguous()
-        # query_xyz = gather_operation(xyz_flipped, query_inds.int())
-        # query_xyz = query_xyz.transpose(1, 2)
         pos_embed = self.pos_embedding(query_xyz, input_range=point_cloud_dims)
         query_embed = self.query_projection(pos_embed)
         return query_xyz, query_embed

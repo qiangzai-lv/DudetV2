@@ -1,4 +1,4 @@
-_base_ = ['./vggt_res50_2x_low_res_depth.py']
+_base_ = ['../../../configs/_base_/default_runtime.py']
 
 
 resume = True
@@ -16,37 +16,13 @@ _token_dim_ = 512
 _decoder_layer_num = 8
 model = dict(
     type='VGGTDet',
-    near_far_range=[0.2, 5.0],
-    rgb_supervision = True, # TODO for nvs
-    depth_supervise=False, # add depth loss in the training.
-    use_nerf_mask=False,
-    gs_cfg = dict(
-        use_rgb_gaussian=True,
-        d_feature=256,
-        num_monocular_samples=12, # TODO how many depth planes
-        num_surfaces=1,
-        use_transmittance=False,
-        gaussians_per_pixel=3, 
-        gaussian_adapter_cfg = dict(
-            gaussian_scale_min=0.5,
-            gaussian_scale_max=15.0, # tune it!
-            sh_degree=4
-        ),
-        opacity_mapping = dict(
-            initial=0.0,
-            final=0.0,
-            warm_up=1
-        ),
-        decoder = dict(
-            name="splatting_cuda"
-        ),
-        dataset = dict(
-            background_color = [0.0, 0.0, 0.0]
-        ),
-    ),
-    vis_dir = None,
-    visualize_bbox = False,
-    topk=3, # for detection.
+    data_preprocessor=dict(
+        type='VGGTDetDataPreprocessor',
+        mean=[123.675, 116.28, 103.53],
+        std=[58.395, 57.12, 57.375],
+        bgr_to_rgb=True,
+        pad_size_divisor=14,
+        pad_value=1.0),
     decoder_cfg = dict( # the same with 3detr
         dec_dim=_token_dim_,
         dec_nhead=4,
@@ -118,7 +94,12 @@ metainfo = dict(CLASSES=class_names)
 file_client_args = dict(backend='disk')
 
 use_depth = False
-input_modality = dict(use_depth=use_depth) # use_depth will load depth map during multi-view pipeline
+input_modality = dict(
+    use_camera=True,
+    use_depth=use_depth,
+    use_lidar=False,
+    use_neuralrecon_depth=False,
+    use_ray=True) # use_depth will load depth map during multi-view pipeline
 backend_args = None
 
 train_collect_keys = [
@@ -136,10 +117,6 @@ test_collect_keys = [
     'denorm_images',
     'c2w', 'intrinsic', 'points', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
 ]
-
-# if use_depth == True:
-#     train_collect_keys.append('depth')
-#     test_collect_keys.append('depth')
 
 
 n_points = 100000
@@ -264,13 +241,7 @@ train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval
 test_cfg = dict()
 val_cfg = dict()
 
-# optim_wrapper = dict(
-#     type='OptimWrapper',
-#     optimizer=dict(type='AdamW', lr=0.0002, weight_decay=0.0001),
-#     paramwise_cfg=dict(
-#         custom_keys={'backbone': dict(lr_mult=0.1, decay_mult=1.0)}),
-#     clip_grad=dict(max_norm=35., norm_type=2))
-
+find_unused_parameters = False
 
 optim_wrapper = dict(
     type='OptimWrapper',
@@ -284,13 +255,7 @@ optim_wrapper = dict(
 
 
 param_scheduler = [
-    # dict(
-    #     type='LinearLR',
-    #     start_factor=1,  # 0.002
-    #     end_factor=1e-6 / 5e-4,
-    #     by_epoch=True,
-    #     begin=0,
-    # ),
+
     dict(
         type='CosineAnnealingLR',
         T_max=_max_epoch-1,  # max_epochs - 1
@@ -302,13 +267,9 @@ param_scheduler = [
 ]
 
 
-
-
 default_hooks = dict(
     checkpoint=dict(type='CheckpointHook', save_best=['mAP_0.25'], rule="greater", interval=2, max_keep_ckpts=1000),
     logger=dict(type='LoggerHook', interval=10)
-    # checkpoint=dict(type='CheckpointHook', save_best='ssim', rule="greater"),
-    # checkpoint=dict(type='CheckpointHook', interval=1, max_keep_ckpts=1)
     )
 
 
