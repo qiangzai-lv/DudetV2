@@ -13,19 +13,19 @@ from mmdet3d.utils import ConfigType, OptConfigType
 from vggt.models.vggt import VGGT
 from vggt.utils.load_fn import load_and_preprocess_images
 
-from projects.VGGTDet.detr3_models.transformer import (MaskedTransformerEncoder, TransformerDecoder, TransformerDecoder_Multilevel,
+from projects.Dudet.detr3_models.transformer import (MaskedTransformerEncoder, TransformerDecoder, TransformerDecoder_Multilevel,
                                 TransformerDecoderLayer, TransformerEncoder,
                                 TransformerEncoderLayer, TransformerEncoderEveryLayer, TransformerCrossEncoder, TransformerSharedAttentionDecoderLayer, TransformerSharedAttentionDecoder, TransformerGuidenceSharedAttentionDecoderLayer)
 
 
-from projects.VGGTDet.detr3_models.third_party_pointnet2.pointnet2.pointnet2_utils import furthest_point_sample
+from projects.Dudet.detr3_models.third_party_pointnet2.pointnet2.pointnet2_utils import furthest_point_sample
 
-from projects.VGGTDet.detr3_models.helpers import GenericMLP
-from projects.VGGTDet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
+from projects.Dudet.detr3_models.helpers import GenericMLP
+from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 import numpy as np
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
 from vggt.utils.geometry import unproject_depth_map_to_point_map, unproject_depth_map_to_point_map_torch
-from projects.VGGTDet.detr3_models.utils.votenet_pc_util import write_oriented_bbox, write_ply, write_ply_rgb, write_bbox
+from projects.Dudet.detr3_models.utils.votenet_pc_util import write_oriented_bbox, write_ply, write_ply_rgb, write_bbox
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 

@@ -4,7 +4,7 @@ _base_ = ['./vggt_res50_2x_low_res_depth.py']
 resume = True
 
 custom_imports = dict(
-    imports=['projects.VGGTDet.vggtdet', 'mmdet3d.evaluation.metrics.Indoor_NVS'],
+    imports=['projects.Dudet.vggtdet', 'mmdet3d.evaluation.metrics.Indoor_NVS'],
     allow_failed_imports=False)
 
 prior_generator = dict(

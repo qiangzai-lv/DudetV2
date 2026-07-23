@@ -11,7 +11,7 @@ from __future__ import (
 import torch
 from torch.autograd import Function
 import torch.nn as nn
-import projects.VGGTDet.detr3_models.third_party_pointnet2.pointnet2.pytorch_utils as pt_utils
+import projects.Dudet.detr3_models.third_party_pointnet2.pointnet2.pytorch_utils as pt_utils
 import sys
 
 try:

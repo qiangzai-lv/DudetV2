@@ -12,10 +12,10 @@ from typing import Optional
 import torch
 from torch import Tensor, nn
 
-from projects.VGGTDet.detr3_models.helpers import (ACTIVATION_DICT, NORM_DICT, WEIGHT_INIT_DICT,
+from projects.Dudet.detr3_models.helpers import (ACTIVATION_DICT, NORM_DICT, WEIGHT_INIT_DICT,
                             get_clones)
 from functools import partial
-from projects.VGGTDet.detr3_models.helpers import GenericMLP
+from projects.Dudet.detr3_models.helpers import GenericMLP
 
 class TransformerEncoder(nn.Module):
 

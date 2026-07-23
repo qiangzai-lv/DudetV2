@@ -1,6 +1,6 @@
 _base_ = ['../../../configs/_base_/default_runtime.py']
 
-custom_imports = dict(imports=['projects.VGGTDet.vggtdet'])
+custom_imports = dict(imports=['projects.Dudet.vggtdet'])
 prior_generator = dict(
     type='AlignedAnchor3DRangeGenerator',
     ranges=[[-3.2, -3.2, -1.28, 3.2, 3.2, 1.28]],
