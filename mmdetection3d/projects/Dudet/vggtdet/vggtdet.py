@@ -18,7 +18,6 @@ from projects.Dudet.detr3_models.transformer import (MaskedTransformerEncoder, T
                                 TransformerEncoderLayer, TransformerEncoderEveryLayer, TransformerCrossEncoder, TransformerSharedAttentionDecoderLayer, TransformerSharedAttentionDecoder, TransformerGuidenceSharedAttentionDecoderLayer)
 
 
-from projects.Dudet.detr3_models.third_party_pointnet2.pointnet2.pointnet2_utils import furthest_point_sample
 
 from projects.Dudet.detr3_models.helpers import GenericMLP
 from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
@@ -30,6 +29,27 @@ from projects.Dudet.detr3_models.utils.votenet_pc_util import write_oriented_bbo
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
 vggt_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+@torch.no_grad()
+def farthest_point_sample(xyz: torch.Tensor, num_samples: int) -> torch.Tensor:
+    """Select spatially distributed query points without a custom CUDA extension."""
+    batch_size, num_points, _ = xyz.shape
+    if num_samples > num_points:
+        raise ValueError("num_samples cannot exceed the point count")
+
+    indices = torch.empty((batch_size, num_samples), dtype=torch.long, device=xyz.device)
+    min_distances = xyz.new_full((batch_size, num_points), float("inf"))
+    batch_indices = torch.arange(batch_size, device=xyz.device)
+    farthest = torch.zeros(batch_size, dtype=torch.long, device=xyz.device)
+
+    for sample_idx in range(num_samples):
+        indices[:, sample_idx] = farthest
+        centroid = xyz[batch_indices, farthest].unsqueeze(1)
+        squared_distances = (xyz - centroid).square().sum(dim=-1)
+        min_distances = torch.minimum(min_distances, squared_distances)
+        farthest = min_distances.max(dim=1).indices
+
+    return indices
 
 
 class LearnableQueries(nn.Module):
@@ -716,7 +736,7 @@ class VGGTDet(Base3DDetector):
         return results
 
     def get_query_embeddings(self, encoder_xyz, point_cloud_dims):
-        query_inds = furthest_point_sample(encoder_xyz, self.num_queries)
+        query_inds = farthest_point_sample(encoder_xyz, self.num_queries)
         query_inds = query_inds.long()
         query_xyz = [torch.gather(encoder_xyz[..., x], 1, query_inds) for x in range(3)]
         query_xyz = torch.stack(query_xyz)
