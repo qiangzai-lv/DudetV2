@@ -1,7 +1,16 @@
 _base_ = ['../../../configs/_base_/default_runtime.py']
 
+import torch
+
+try:
+    import torch_npu  # noqa: F401
+    _dist_backend_ = 'hccl' if torch.npu.is_available() else 'nccl'
+except ImportError:
+    _dist_backend_ = 'nccl'
 
 resume = True
+
+env_cfg = dict(dist_cfg=dict(backend=_dist_backend_))
 
 custom_imports = dict(imports=['projects.Dudet.vggtdet'], allow_failed_imports=False)
 

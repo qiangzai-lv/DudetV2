@@ -483,12 +483,13 @@ class VGGTDetDataPreprocessor(DetDataPreprocessor):
                 res_coors_numpy = res_coors.cpu().numpy()
                 inds, point2voxel_map = self.sparse_quantize(
                     res_coors_numpy, return_index=True, return_inverse=True)
-                point2voxel_map = torch.from_numpy(point2voxel_map).cuda()
+                point2voxel_map = torch.from_numpy(point2voxel_map).to(
+                    device=res.device)
                 if self.training and self.max_voxels is not None:
                     if len(inds) > self.max_voxels:
                         inds = np.random.choice(
                             inds, self.max_voxels, replace=False)
-                inds = torch.from_numpy(inds).cuda()
+                inds = torch.from_numpy(inds).to(device=res.device)
                 if hasattr(data_sample.gt_pts_seg, 'pts_semantic_mask'):
                     data_sample.gt_pts_seg.voxel_semantic_mask \
                         = data_sample.gt_pts_seg.pts_semantic_mask[inds]

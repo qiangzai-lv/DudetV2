@@ -12,6 +12,8 @@ from mmengine.registry import DefaultScope
 from mmengine.runner import load_checkpoint
 from mmengine.structures import InstanceData
 
+from projects.Dudet.vggtdet.device import get_device
+
 
 SCANNET_CLASSES = (
     "cabinet", "bed", "chair", "sofa", "table", "door", "window", "bookshelf",
@@ -29,8 +31,9 @@ class GroundingDINO2DDetector(nn.Module):
                  inference_batch_size: int = 1,
                  use_grounding_dino: bool = True,
                  classes: Sequence[str] = None,
-                 device: str = "cuda:0") -> None:
+                 device=None) -> None:
         super().__init__()
+        device = get_device() if device is None else device
         self.use_grounding_dino = use_grounding_dino
         self.detector = None
         self.test_pipeline = None

@@ -12,6 +12,7 @@ from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from projects.Dudet.detr3_models.helpers import GenericMLP
 from projects.Dudet.detr3_models.utils.votenet_pc_util import write_ply_rgb
+from projects.Dudet.vggtdet.device import autocast, get_device
 from projects.Dudet.vggtdet.grounding_dino import GroundingDINO2DDetector
 from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from projects.Dudet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
@@ -23,9 +24,7 @@ if str(_VGGT_OMEGA_ROOT) not in sys.path:
 from vggt_omega.models import VGGTOmega
 from vggt_omega.utils.pose_enc import encoding_to_camera
 
-device = "cuda" if torch.cuda.is_available() else "cpu"
-# bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
-vggt_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+device = get_device()
 
 
 @torch.no_grad()
@@ -258,7 +257,7 @@ class VGGTDet(Base3DDetector):
             self.vggt_encoder.eval()
 
         with torch.no_grad():
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(device):
                 img = batch_inputs_dict['imgs'].float().div(255.0)
                 aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img)
                 return aggregated_tokens_list, ps_idx, img
@@ -480,7 +479,7 @@ class VGGTDet(Base3DDetector):
         vggt_token_list, ps_idx, img = self.extract_feat(batch_inputs_dict)
 
         if self.if_mix_precision:
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(device):
                 box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
         else: 
             box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
@@ -498,7 +497,7 @@ class VGGTDet(Base3DDetector):
         vggt_token_list, ps_idx, img = self.extract_feat(batch_inputs_dict)
 
         if self.if_mix_precision:
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(device):
                 box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
         else:
             box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
@@ -518,7 +517,7 @@ class VGGTDet(Base3DDetector):
         vggt_token_list, ps_idx, img = self.extract_feat(batch_inputs_dict)
 
         if self.if_mix_precision:
-            with torch.cuda.amp.autocast(dtype=vggt_dtype):
+            with autocast(device):
                 box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
         else:
             box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)

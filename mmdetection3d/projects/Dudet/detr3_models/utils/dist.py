@@ -4,6 +4,11 @@ import pickle
 import torch
 import torch.distributed as dist
 
+try:
+    import torch_npu  # noqa: F401
+except ImportError:
+    torch_npu = None
+
 
 def is_distributed():
     if not dist.is_available() or not dist.is_initialized():
@@ -49,7 +54,12 @@ def setup_print_for_distributed(is_primary):
 
 
 def init_distributed(gpu_id, global_rank, world_size, dist_url, dist_backend):
-    torch.cuda.set_device(gpu_id)
+    if torch_npu is not None and torch.npu.is_available():
+        torch.npu.set_device(gpu_id)
+        if dist_backend == 'nccl':
+            dist_backend = 'hccl'
+    elif torch.cuda.is_available():
+        torch.cuda.set_device(gpu_id)
     print(
         f"| distributed init (rank {global_rank}) (world {world_size}): {dist_url}",
         flush=True,

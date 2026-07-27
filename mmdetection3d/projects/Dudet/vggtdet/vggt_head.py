@@ -96,7 +96,7 @@ class VGGTDetHead(BaseModule):
         self.pts_assign_threshold = pts_assign_threshold
         self.pts_center_threshold = pts_center_threshold
         self.prior_generator = TASK_UTILS.build(prior_generator)
-        class_weights = torch.ones((self.n_classes+1), device='cuda') * 1.0
+        class_weights = torch.ones(self.n_classes + 1)
         class_weights[-1] = loss_weights['not_objness_loss']
         self.cls_loss = nn.CrossEntropyLoss(weight=class_weights) #MODELS.build(cls_loss)
         self.objness_loss = MODELS.build(objness_loss)
@@ -826,7 +826,6 @@ class UnifiedMatcherMoreThanOne(nn.Module):
             centers[:, 1] + sizes[:, 1]/2.0, centers[:, 2] + sizes[:, 2]/2.0
         ], -1)
     
-
 
 
 

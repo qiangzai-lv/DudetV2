@@ -4,6 +4,7 @@ import numpy as np
 from collections import deque
 from typing import List
 from projects.Dudet.detr3_models.utils.dist import is_distributed, barrier, all_reduce_sum
+from projects.Dudet.vggtdet.device import get_device
 
 
 def my_worker_init_fn(worker_id):
@@ -61,7 +62,8 @@ class SmoothedValue(object):
         """
         if not is_distributed():
             return
-        t = torch.tensor([self.count, self.total], dtype=torch.float64, device="cuda")
+        t = torch.tensor([self.count, self.total], dtype=torch.float64,
+                         device=get_device())
         barrier()
         all_reduce_sum(t)
         t = t.tolist()
