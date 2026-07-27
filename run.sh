@@ -1,0 +1,1 @@
+bash tools/dist_train.sh projects/Dudet/config/vggtdet_scannet.py 1

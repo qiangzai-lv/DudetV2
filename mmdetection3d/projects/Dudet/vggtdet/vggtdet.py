@@ -1,6 +1,5 @@
 from typing import List, Tuple, Union
 
-import os
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -9,22 +8,14 @@ from mmdet3d.models.detectors import Base3DDetector
 from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
-
-from vggt.models.vggt import VGGT
-from vggt.utils.load_fn import load_and_preprocess_images
-
-from projects.Dudet.detr3_models.transformer import (MaskedTransformerEncoder, TransformerDecoder, TransformerDecoder_Multilevel,
-                                TransformerDecoderLayer, TransformerEncoder,
-                                TransformerEncoderLayer, TransformerEncoderEveryLayer, TransformerCrossEncoder, TransformerSharedAttentionDecoderLayer, TransformerSharedAttentionDecoder, TransformerGuidenceSharedAttentionDecoderLayer)
-
-
-
 from projects.Dudet.detr3_models.helpers import GenericMLP
+from projects.Dudet.vggtdet.grounding_dino import GroundingDINO2DDetector
 from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
-import numpy as np
+from projects.Dudet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
+                                                     TransformerDecoderLayer)
+from vggt.models.vggt import VGGT
+from vggt.utils.geometry import unproject_depth_map_to_point_map_torch
 from vggt.utils.pose_enc import pose_encoding_to_extri_intri
-from vggt.utils.geometry import unproject_depth_map_to_point_map, unproject_depth_map_to_point_map_torch
-from projects.Dudet.detr3_models.utils.votenet_pc_util import write_oriented_bbox, write_ply, write_ply_rgb, write_bbox
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
@@ -67,26 +58,6 @@ class ChannelProjecter(nn.Module):
         super().__init__()
         
         self.proj = nn.Sequential(
-            # nn.Conv2d(
-            #         in_channels=in_channels,
-            #         out_channels=in_channels//4*3,
-            #         kernel_size=1,
-            #         stride=1,
-            #         padding=0
-            #     ),
-            # nn.GroupNorm(num_groups=1, num_channels=in_channels//4 * 3),
-            # nn.GELU(),
-            
-            # nn.Conv2d(
-            #         in_channels=in_channels//4*3,
-            #         out_channels=in_channels//2,
-            #         kernel_size=1,
-            #         stride=1,
-            #         padding=0
-            #             ),
-            # nn.GroupNorm(num_groups=1, num_channels=in_channels//2),
-            # nn.GELU(),
-
             nn.Conv2d(
                     in_channels=in_channels,
                     out_channels=in_channels//2,
@@ -96,17 +67,6 @@ class ChannelProjecter(nn.Module):
                             ),
             nn.GroupNorm(num_groups=1, num_channels=in_channels//2),
             nn.GELU(),
-
-            # nn.Conv2d(
-            #         in_channels=in_channels//2,
-            #         out_channels=in_channels//4,
-            #         kernel_size=1,
-            #         stride=1,
-            #         padding=0
-            #                 ),
-            # nn.GroupNorm(num_groups=1, num_channels=in_channels//4),
-            # nn.GELU(),
-
             nn.Conv2d(
                     in_channels=in_channels//2,
                     out_channels=out_channels,
@@ -136,6 +96,7 @@ class VGGTDet(Base3DDetector):
     def __init__(
             self,
             bbox_head: ConfigType,
+            two_d_detector: OptConfigType = None,
             train_cfg: OptConfigType = None,
             test_cfg: OptConfigType = None,
             data_preprocessor: OptConfigType = None,
@@ -166,8 +127,21 @@ class VGGTDet(Base3DDetector):
         bbox_head.update(train_cfg=train_cfg)
         bbox_head.update(test_cfg=test_cfg)
         self.bbox_head = MODELS.build(bbox_head)
-        
-        self.vggt_encoder = VGGT.from_pretrained("facebook/VGGT-1B").to(device)
+        self.two_d_detector = None
+        if two_d_detector and two_d_detector.get("enabled", False):
+            self.two_d_detector = GroundingDINO2DDetector(
+                config=two_d_detector["config"],
+                checkpoint=two_d_detector["checkpoint"],
+                score_thr=two_d_detector.get("score_thr", 0.25),
+                nms_iou_thr=two_d_detector.get("nms_iou_thr", 0.5),
+                max_per_view=two_d_detector.get("max_per_view", 100),
+                inference_batch_size=two_d_detector.get(
+                    "inference_batch_size", 8),
+                use_grounding_dino=two_d_detector.get(
+                    "use_grounding_dino", True),
+                classes=two_d_detector.get("classes"),
+                device=device)
+        self.vggt_encoder = VGGT.from_pretrained("/mnt/workspace/pretrain/VGGT-1B/").to(device)
 
         for param in self.vggt_encoder.parameters():
             param.requires_grad = False
@@ -176,13 +150,6 @@ class VGGTDet(Base3DDetector):
 
         self.decoder = build_decoder(decoder_cfg, if_multilevel=use_multi_layers)
 
-        # self.proj_feat_dim = nn.Conv2d(
-        #             in_channels=2048,
-        #             out_channels=token_dim,
-        #             kernel_size=1,
-        #             stride=1,
-        #             padding=0
-        #         )
         if if_simpler_project:
             if use_multi_layers: 
                 self.proj_feat_dim0 = nn.Conv2d(
@@ -213,13 +180,6 @@ class VGGTDet(Base3DDetector):
                     stride=1,
                     padding=0
                 )
-                # self.proj_feat_dim4 = nn.Conv2d(
-                #     in_channels=2048,
-                #     out_channels=token_dim,
-                #     kernel_size=1,
-                #     stride=1,
-                #     padding=0
-                # )
             else:
                 self.proj_feat_dim = nn.Conv2d(
                     in_channels=2048,
@@ -234,7 +194,6 @@ class VGGTDet(Base3DDetector):
                 self.proj_feat_dim1 = ChannelProjecter(in_channels=2048, out_channels=token_dim) 
                 self.proj_feat_dim2 = ChannelProjecter(in_channels=2048, out_channels=token_dim) 
                 self.proj_feat_dim3 = ChannelProjecter(in_channels=2048, out_channels=token_dim)
-                # self.proj_feat_dim4 = ChannelProjecter(in_channels=2048, out_channels=token_dim)
             else:
                 self.proj_feat_dim = ChannelProjecter(in_channels=2048, out_channels=token_dim)
 
@@ -572,6 +531,9 @@ class VGGTDet(Base3DDetector):
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
 
+        if self.two_d_detector is not None:
+            batch_inputs_dict["view_2d_instances"] = self.two_d_detector(
+                batch_data_samples)
 
         vggt_token_list, ps_idx, img, images_patch_attn = self.extract_feat(batch_inputs_dict, batch_data_samples, 'train')
 
@@ -722,5 +684,3 @@ def build_decoder(args, if_multilevel=False):
             decoder_layer, num_layers=args.dec_nlayers, return_intermediate=True
         )
     return decoder
-
-

@@ -3,7 +3,9 @@
   <component name="NewModuleRootManager">
     <content url="file://$MODULE_DIR$">
       <sourceFolder url="file://$MODULE_DIR$/VGGT-Det-CVPR2026" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/mmdetection/mmdet" isTestSource="false" />
       <sourceFolder url="file://$MODULE_DIR$/mmdetection3d" isTestSource="false" />
+      <sourceFolder url="file://$MODULE_DIR$/mmdetection3d/vggt-omega" isTestSource="false" />
     </content>
     <orderEntry type="jdk" jdkName="Python 3.11 (base)" jdkType="Python SDK" />
     <orderEntry type="sourceFolder" forTests="false" />

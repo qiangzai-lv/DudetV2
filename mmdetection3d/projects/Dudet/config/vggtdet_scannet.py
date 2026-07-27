@@ -3,9 +3,7 @@ _base_ = ['../../../configs/_base_/default_runtime.py']
 
 resume = True
 
-custom_imports = dict(
-    imports=['projects.Dudet.vggtdet', 'mmdet3d.evaluation.metrics.Indoor_NVS'],
-    allow_failed_imports=False)
+custom_imports = dict(imports=['projects.Dudet.vggtdet'], allow_failed_imports=False)
 
 prior_generator = dict(
     type='AlignedAnchor3DRangeGenerator',
@@ -23,6 +21,15 @@ model = dict(
         bgr_to_rgb=True,
         pad_size_divisor=14,
         pad_value=1.0),
+    two_d_detector=dict(
+        enabled=True,
+        config="../mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py",
+        checkpoint="/mnt/workspace/pretrain/grounding_dino_swin-l_pretrain_all-56d69e78.pth",
+        score_thr=0.25,
+        nms_iou_thr=0.5,
+        max_per_view=100,
+        inference_batch_size=4,
+        use_grounding_dino=False),
     decoder_cfg = dict( # the same with 3detr
         dec_dim=_token_dim_,
         dec_nhead=4,
@@ -82,7 +89,7 @@ model = dict(
 dataset_type = 'MultiViewScanNetDataset'
 # Configure the data_root path to your dataset location
 # data_root = '/path/to/your/scannet/data/'
-data_root = './data/scannet/'
+data_root = '/mnt/workspace/data/ScanNet_processed/'
 
 
 class_names = [
@@ -195,7 +202,7 @@ test_pipeline = [
 ]
 
 train_dataloader = dict(
-    batch_size=10,
+    batch_size=1,
     num_workers=8,
     persistent_workers=True,
     sampler=dict(type='DefaultSampler', shuffle=True),
@@ -232,7 +239,6 @@ val_dataloader = dict(
 test_dataloader = val_dataloader
 
 val_evaluator = [dict(type='IndoorMetric')]
-# val_evaluator = [dict(type='IndoorMetric'), dict(type='MVSMetric')]
 test_evaluator = val_evaluator
 
 _warm_epoch=0
@@ -274,12 +280,6 @@ default_hooks = dict(
 
 
 
-vis_backends = [dict(type='LocalVisBackend'), dict(type='WandbVisBackend', init_kwargs={
-            'project': 'vggt_det',
-            'group': 'baseline',
-            'entity':'3dv_team', 
-            'name': '4layer_scannet_axis_no_norm_predpc_c2lr_400e_atten_fps_lmdis_08_one2more_matching_task_query_again',
-            'notes': 'debug'
-         })]
+vis_backends = [dict(type='LocalVisBackend')]
 visualizer = dict(
     type='Det3DLocalVisualizer', vis_backends=vis_backends, name='visualizer')
