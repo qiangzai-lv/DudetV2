@@ -6,6 +6,7 @@
         <option value="$PROJECT_DIR$/mmdetection/mmdet" />
         <option value="$PROJECT_DIR$/temp/mmdet" />
         <option value="$PROJECT_DIR$/temp" />
+        <option value="$PROJECT_DIR$/mmdetection3d/vggt_omega" />
       </set>
     </option>
   </component>

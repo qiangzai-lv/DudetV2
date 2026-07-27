@@ -143,6 +143,13 @@ class GroundingDINO2DDetector(nn.Module):
         return InstanceData(
             bboxes=bboxes[keep], scores=scores[keep], labels=labels[keep])
 
+    @staticmethod
+    def _empty_instances(device):
+        return InstanceData(
+            bboxes=torch.empty((0, 4), device=device),
+            labels=torch.empty((0,), dtype=torch.long, device=device),
+            scores=torch.empty((0,), device=device))
+
     def _infer_views(self, image_paths):
         results = []
         for start in range(0, len(image_paths), self.inference_batch_size):
@@ -177,31 +184,44 @@ class GroundingDINO2DDetector(nn.Module):
         return image_shapes
 
     @torch.no_grad()
-    def forward(self, batch_data_samples):
+    def forward(self, batch_data_samples, view_indices=None):
+        if view_indices is not None and len(view_indices) != len(batch_data_samples):
+            raise ValueError('view_indices must provide one entry per sample.')
         batch_instances = []
-        for data_sample in batch_data_samples:
+        for sample_index, data_sample in enumerate(batch_data_samples):
             image_paths = data_sample.metainfo["img_path"]
             if isinstance(image_paths, str):
                 image_paths = [image_paths]
+            if view_indices is None:
+                selected_indices = list(range(len(image_paths)))
+            else:
+                selected_indices = [int(index) for index in view_indices[sample_index]]
+                if any(index < 0 or index >= len(image_paths)
+                       for index in selected_indices):
+                    raise ValueError('view_indices contains an invalid view index.')
+
+            instance_device = data_sample.gt_instances_3d.bboxes_3d.tensor.device
+            view_instances = [
+                self._empty_instances(instance_device)
+                for _ in image_paths
+            ]
 
             if self.use_grounding_dino:
                 with DefaultScope.overwrite_default_scope("mmdet"):
-                    results = self._infer_views(image_paths)
-                view_instances = []
-                for view_index, result in enumerate(results):
+                    results = self._infer_views(
+                        [image_paths[index] for index in selected_indices])
+                for view_index, result in zip(selected_indices, results):
                     gt_instances = self._project_gt_instances(
                         data_sample, view_index,
                         result.metainfo["ori_shape"],
                         result.pred_instances.bboxes.device)
-                    view_instances.append(
-                        self._merge_and_nms(result.pred_instances, gt_instances))
+                    view_instances[view_index] = self._merge_and_nms(
+                        result.pred_instances, gt_instances)
             else:
-                device = data_sample.gt_instances_3d.bboxes_3d.tensor.device
-                view_instances = [
-                    self._project_gt_instances(
-                        data_sample, view_index, image_shape, device)
-                    for view_index, image_shape in enumerate(
-                        self._get_view_shapes(data_sample, len(image_paths)))
-                ]
+                image_shapes = self._get_view_shapes(data_sample, len(image_paths))
+                for view_index in selected_indices:
+                    view_instances[view_index] = self._project_gt_instances(
+                        data_sample, view_index, image_shapes[view_index],
+                        instance_device)
             batch_instances.append(view_instances)
         return batch_instances

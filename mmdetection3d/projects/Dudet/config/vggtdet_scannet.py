@@ -35,7 +35,7 @@ model = dict(
         config="../mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py",
         checkpoint="/mnt/workspace/pretrain/grounding_dino_swin-l_pretrain_all-56d69e78.pth",
         score_thr=0.1,
-        nms_iou_thr=0.5,
+        nms_iou_thr=0.6,
         max_per_view=100,
         inference_batch_size=4,
         use_grounding_dino=True),
@@ -92,8 +92,9 @@ model = dict(
     vggt_omega_checkpoint='/mnt/workspace/pretrain/VGGT-Omega/vggt_omega_1b_512.pt',
     visualize_pred_pointcloud=False,
     pred_pointcloud_path='vis_dir/pred_points',
-    query_3d_nms_iou_thr=0.25,
-    query_min_points=16
+    query_3d_nms_iou_thr=0.4,
+    query_min_points=16,
+    keyframe_count=12
     )
 
 dataset_type = 'MultiViewScanNetDataset'

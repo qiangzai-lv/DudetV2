@@ -117,7 +117,8 @@ class VGGTDet(Base3DDetector):
             visualize_pred_pointcloud=False,
             pred_pointcloud_path='vis_dir/pred_points',
             query_3d_nms_iou_thr=0.25,
-            query_min_points=16
+            query_min_points=16,
+            keyframe_count=0
             ):
         
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg) 
@@ -245,6 +246,7 @@ class VGGTDet(Base3DDetector):
         self.pred_pointcloud_path = Path(pred_pointcloud_path)
         self.query_3d_nms_iou_thr = query_3d_nms_iou_thr
         self.query_min_points = query_min_points
+        self.keyframe_count = keyframe_count
 
 
     @torch.no_grad()
@@ -311,6 +313,72 @@ class VGGTDet(Base3DDetector):
             order = remaining[iou <= iou_thr]
         return torch.stack(keep)
 
+    @staticmethod
+    @torch.no_grad()
+    def _farthest_point_fill(points, existing_centers, num_samples):
+        if num_samples <= 0 or len(points) == 0:
+            return points.new_empty((0, 3))
+
+        num_samples = min(num_samples, len(points))
+        selected = torch.zeros(
+            len(points), dtype=torch.bool, device=points.device)
+        if len(existing_centers) > 0:
+            min_distances = (
+                (points[:, None, :] - existing_centers[None, :, :])
+                .square().sum(dim=-1).min(dim=1).values)
+        else:
+            min_distances = points.square().sum(dim=-1)
+
+        sampled_indices = []
+        for _ in range(num_samples):
+            current = min_distances.argmax()
+            sampled_indices.append(current)
+            selected[current] = True
+            distances = (points - points[current]).square().sum(dim=-1)
+            min_distances = torch.minimum(min_distances, distances)
+            min_distances[selected] = -1
+        return points[torch.stack(sampled_indices)]
+
+    @torch.no_grad()
+    def _select_keyframe_indices(self, aggregated_tokens_list, ps_idx, images):
+        num_views = images.shape[1]
+        if self.keyframe_count <= 0 or self.keyframe_count >= num_views:
+            return None
+
+        pose_enc = self.vggt_encoder.camera_head(
+            aggregated_tokens_list, patch_token_start=ps_idx)
+        extrinsics, _ = encoding_to_camera(pose_enc, images.shape[-2:])
+        rotation = extrinsics[..., :3, :3].float()
+        translation = extrinsics[..., :3, 3].float()
+        camera_centers = -torch.matmul(
+            rotation.transpose(-1, -2), translation.unsqueeze(-1)).squeeze(-1)
+        keyframe_count = min(self.keyframe_count, num_views)
+        batch_indices = []
+        for centers in camera_centers:
+            if not torch.isfinite(centers).all():
+                indices = torch.linspace(
+                    0, num_views - 1, keyframe_count,
+                    device=centers.device).round().long()
+                batch_indices.append(indices)
+                continue
+
+            selected = torch.zeros(num_views, dtype=torch.bool,
+                                   device=centers.device)
+            min_distances = torch.full(
+                (num_views,), float('inf'), device=centers.device)
+            current = 0
+            indices = []
+            for _ in range(keyframe_count):
+                indices.append(current)
+                selected[current] = True
+                distances = (centers - centers[current]).square().sum(dim=-1)
+                min_distances = torch.minimum(min_distances, distances)
+                min_distances[selected] = -1
+                current = int(min_distances.argmax().item())
+            batch_indices.append(torch.tensor(
+                sorted(indices), device=centers.device, dtype=torch.long))
+        return batch_indices
+
     def _build_2d_box_queries(self, aggregated_tokens_list, ps_idx, images,
                               batch_inputs_dict, batch_data_samples):
         if 'view_2d_instances' not in batch_inputs_dict:
@@ -372,15 +440,47 @@ class VGGTDet(Base3DDetector):
                 keep = self._aligned_3d_nms(
                     proposals, proposal_scores, self.query_3d_nms_iou_thr)
                 proposals = proposals[keep[:self.num_queries]]
-                print(proposals.shape)
             else:
-                proposals = point_maps.new_zeros((1, 6))
+                proposals = point_maps.new_empty((0, 6))
 
             if len(proposals) < self.num_queries:
-                proposals = torch.cat([
-                    proposals,
-                    proposals[-1:].expand(self.num_queries - len(proposals), -1)
-                ])
+                keyframe_indices = batch_inputs_dict.get('keyframe_indices')
+                if keyframe_indices is None:
+                    view_indices = torch.arange(
+                        point_maps.shape[1], device=point_maps.device)
+                else:
+                    view_indices = keyframe_indices[batch_index].to(
+                        device=point_maps.device)
+                sampled_points = point_maps[
+                    batch_index, view_indices, ::16, ::16].reshape(-1, 3)
+                sampled_depth = depth_map[
+                    batch_index, view_indices, ::16, ::16].reshape(-1)
+                valid_points = torch.isfinite(sampled_points).all(dim=-1)
+                valid_points &= sampled_depth > 1e-5
+                valid_points &= sampled_depth <= self.depth_thres
+                sampled_points = sampled_points[valid_points]
+                if len(sampled_points) == 0:
+                    sampled_points = point_maps[
+                        batch_index, view_indices].reshape(-1, 3)
+                    full_depth = depth_map[
+                        batch_index, view_indices].reshape(-1)
+                    valid_points = torch.isfinite(sampled_points).all(dim=-1)
+                    valid_points &= full_depth > 1e-5
+                    valid_points &= full_depth <= self.depth_thres
+                    sampled_points = sampled_points[valid_points]
+                filler_points = self._farthest_point_fill(
+                    sampled_points,
+                    (proposals[:, :3] + proposals[:, 3:]) * 0.5,
+                    self.num_queries - len(proposals))
+                filler_boxes = torch.cat([filler_points, filler_points], dim=-1)
+                proposals = torch.cat([proposals, filler_boxes])
+                if len(proposals) < self.num_queries:
+                    if len(proposals) == 0:
+                        proposals = point_maps.new_zeros((1, 6))
+                    proposals = torch.cat([
+                        proposals,
+                        proposals[-1:].expand(self.num_queries - len(proposals), -1)
+                    ])
             batch_boxes.append(proposals)
             if visual_points:
                 batch_visual_points.append(torch.cat(visual_points)[:100000])
@@ -389,7 +489,7 @@ class VGGTDet(Base3DDetector):
 
         query_boxes = torch.stack(batch_boxes)
         batch_inputs_dict['query_3d_boxes'] = query_boxes
-        self._save_pred_pointclouds(batch_visual_points, batch_data_samples)
+        # self._save_pred_pointclouds(batch_visual_points, batch_data_samples)
         return (query_boxes[..., :3] + query_boxes[..., 3:]) * 0.5
 
     def _encode_query_centers(self, query_xyz):
@@ -474,9 +574,9 @@ class VGGTDet(Base3DDetector):
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
 
-        self._add_view_2d_instances(batch_inputs_dict, batch_data_samples)
-
         vggt_token_list, ps_idx, img = self.extract_feat(batch_inputs_dict)
+        self._add_view_2d_instances(
+            batch_inputs_dict, batch_data_samples, vggt_token_list, ps_idx, img)
 
         if self.if_mix_precision:
             with autocast(device):
@@ -493,8 +593,9 @@ class VGGTDet(Base3DDetector):
     def predict(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                 **kwargs) -> SampleList:
 
-        self._add_view_2d_instances(batch_inputs_dict, batch_data_samples)
         vggt_token_list, ps_idx, img = self.extract_feat(batch_inputs_dict)
+        self._add_view_2d_instances(
+            batch_inputs_dict, batch_data_samples, vggt_token_list, ps_idx, img)
 
         if self.if_mix_precision:
             with autocast(device):
@@ -513,8 +614,9 @@ class VGGTDet(Base3DDetector):
 
     def _forward(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
                  *args, **kwargs) -> Tuple[List[torch.Tensor]]:
-        self._add_view_2d_instances(batch_inputs_dict, batch_data_samples)
         vggt_token_list, ps_idx, img = self.extract_feat(batch_inputs_dict)
+        self._add_view_2d_instances(
+            batch_inputs_dict, batch_data_samples, vggt_token_list, ps_idx, img)
 
         if self.if_mix_precision:
             with autocast(device):
@@ -528,14 +630,18 @@ class VGGTDet(Base3DDetector):
         results = self.bbox_head.forward(box_features, batch_inputs_dict)
         return results
 
-    def _add_view_2d_instances(self, batch_inputs_dict, batch_data_samples):
+    def _add_view_2d_instances(self, batch_inputs_dict, batch_data_samples,
+                               aggregated_tokens_list, ps_idx, images):
         if self.two_d_detector is None:
             if self.if_use_pred_pc_query:
                 raise RuntimeError(
                     'two_d_detector must be enabled for 2D-box 3D queries.')
             return
+        keyframe_indices = self._select_keyframe_indices(
+            aggregated_tokens_list, ps_idx, images)
+        batch_inputs_dict['keyframe_indices'] = keyframe_indices
         batch_inputs_dict['view_2d_instances'] = self.two_d_detector(
-            batch_data_samples)
+            batch_data_samples, view_indices=keyframe_indices)
 
 def build_decoder(args, if_multilevel=False):
     decoder_layer = TransformerDecoderLayer(
