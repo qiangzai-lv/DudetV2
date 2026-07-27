@@ -1,3 +1,5 @@
+import sys
+from pathlib import Path
 from typing import List, Tuple, Union
 
 import torch
@@ -9,17 +11,47 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from projects.Dudet.detr3_models.helpers import GenericMLP
+from projects.Dudet.detr3_models.utils.votenet_pc_util import write_ply_rgb
 from projects.Dudet.vggtdet.grounding_dino import GroundingDINO2DDetector
 from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from projects.Dudet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
                                                      TransformerDecoderLayer)
-from vggt.models.vggt import VGGT
-from vggt.utils.geometry import unproject_depth_map_to_point_map_torch
-from vggt.utils.pose_enc import pose_encoding_to_extri_intri
+_VGGT_OMEGA_ROOT = Path(__file__).resolve().parents[3] / 'vggt-omega'
+if str(_VGGT_OMEGA_ROOT) not in sys.path:
+    sys.path.insert(0, str(_VGGT_OMEGA_ROOT))
+
+from vggt_omega.models import VGGTOmega
+from vggt_omega.utils.pose_enc import encoding_to_camera
 
 device = "cuda" if torch.cuda.is_available() else "cpu"
 # bfloat16 is supported on Ampere GPUs (Compute Capability 8.0+) 
 vggt_dtype = torch.bfloat16 if torch.cuda.get_device_capability()[0] >= 8 else torch.float16
+
+
+@torch.no_grad()
+def unproject_depth_map_to_point_map_torch(
+        depth_map: torch.Tensor, extrinsics: torch.Tensor,
+        intrinsics: torch.Tensor) -> torch.Tensor:
+    """Unproject depth maps with OpenCV camera-from-world extrinsics."""
+    batch_size, num_views, height, width = depth_map.shape
+    y, x = torch.meshgrid(
+        torch.arange(height, device=depth_map.device, dtype=depth_map.dtype),
+        torch.arange(width, device=depth_map.device, dtype=depth_map.dtype),
+        indexing='ij')
+    x = x.view(1, 1, height, width)
+    y = y.view(1, 1, height, width)
+    fx = intrinsics[..., 0, 0].view(batch_size, num_views, 1, 1)
+    fy = intrinsics[..., 1, 1].view(batch_size, num_views, 1, 1)
+    cx = intrinsics[..., 0, 2].view(batch_size, num_views, 1, 1)
+    cy = intrinsics[..., 1, 2].view(batch_size, num_views, 1, 1)
+    camera_points = torch.stack(
+        [(x - cx) * depth_map / fx, (y - cy) * depth_map / fy, depth_map],
+        dim=-1)
+    rotation = extrinsics[..., :3, :3]
+    translation = extrinsics[..., :3, 3]
+    return torch.einsum(
+        'bsji,bshwj->bshwi', rotation,
+        camera_points - translation[:, :, None, None, :])
 
 @torch.no_grad()
 def farthest_point_sample(xyz: torch.Tensor, num_samples: int) -> torch.Tensor:
@@ -119,7 +151,10 @@ class VGGTDet(Base3DDetector):
             lambda_dist=1.0,
             if_task_query=False,
             if_add_noises=False,
-            noise_level=None
+            noise_level=None,
+            vggt_omega_checkpoint='/mnt/workspace/pretrain/VGGT-Omega/vggt_omega_1b_512.pt',
+            visualize_pred_pointcloud=False,
+            pred_pointcloud_path='vis_dir/pred_points'
             ):
         
         super().__init__(data_preprocessor=data_preprocessor, init_cfg=init_cfg) 
@@ -141,7 +176,10 @@ class VGGTDet(Base3DDetector):
                     "use_grounding_dino", True),
                 classes=two_d_detector.get("classes"),
                 device=device)
-        self.vggt_encoder = VGGT.from_pretrained("/mnt/workspace/pretrain/VGGT-1B/").to(device)
+        self.vggt_encoder = VGGTOmega()
+        self.vggt_encoder.load_state_dict(
+            torch.load(vggt_omega_checkpoint, map_location='cpu'))
+        self.vggt_encoder.to(device)
 
         for param in self.vggt_encoder.parameters():
             param.requires_grad = False
@@ -246,6 +284,8 @@ class VGGTDet(Base3DDetector):
         self.lambda_dist = lambda_dist
         self.if_add_noises = if_add_noises
         self.noise_level = noise_level
+        self.visualize_pred_pointcloud = visualize_pred_pointcloud
+        self.pred_pointcloud_path = Path(pred_pointcloud_path)
 
 
     @torch.no_grad()
@@ -260,21 +300,12 @@ class VGGTDet(Base3DDetector):
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=vggt_dtype):
-                img = batch_inputs_dict['imgs'] # (bs, 40, 3, 392, 518)
-                img = img.float()
                 if self.if_use_atten_sample or self.if_use_atten_fps:
-                    aggregated_tokens_list, ps_idx, images_patch_attn = self.vggt_encoder.aggregator(img, if_norm=False, if_detach=True, 
-                                                                                                     if_only_last_layer=(not self.use_multi_layers), 
-                                                                                                     if_use_atten_sample=True, 
-                                                                                                     if_task_query=self.if_task_query) # if_norm=False because we have norm it in the data layer
-                    return aggregated_tokens_list, ps_idx, img, images_patch_attn
-                else:
-                    aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img, if_norm=False, 
-                                                                                  if_detach=True, 
-                                                                                  if_only_last_layer=(not self.use_multi_layers), 
-                                                                                  if_use_atten_sample=False,
-                                                                                  if_task_query=self.if_task_query) 
-                    return aggregated_tokens_list, ps_idx, img, None
+                    raise ValueError(
+                        'VGGT-Omega does not provide patch attention scores.')
+                img = batch_inputs_dict['imgs'].float().div(255.0)
+                aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img)
+                return aggregated_tokens_list, ps_idx, img, None
 
 
 
@@ -299,24 +330,27 @@ class VGGTDet(Base3DDetector):
             return points[batch_indices, indices]
 
     @torch.no_grad()
-    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images, batch_inputs_dict, images_patch_attn):
+    def pred_pc_from_vggt(self, aggregated_tokens_list_ori, ps_idx, images,
+                          batch_inputs_dict, images_patch_attn,
+                          batch_data_samples):
 
         with torch.no_grad():
             with torch.cuda.amp.autocast(dtype=vggt_dtype): 
-                if not aggregated_tokens_list_ori[0].is_contiguous():
-                    aggregated_tokens_list = [i.contiguous() for i in aggregated_tokens_list_ori]
-                    del aggregated_tokens_list_ori
-                else:
-                    aggregated_tokens_list = aggregated_tokens_list_ori
+                aggregated_tokens_list = [
+                    tokens.contiguous() if tokens is not None else None
+                    for tokens in aggregated_tokens_list_ori]
 
             with torch.cuda.amp.autocast(enabled=False):
 
-                pose_enc = self.vggt_encoder.camera_head(aggregated_tokens_list)[-1]
+                pose_enc = self.vggt_encoder.camera_head(
+                    aggregated_tokens_list, patch_token_start=ps_idx)
                 # Extrinsic and intrinsic matrices, following OpenCV convention (camera from world)
-                extrinsic, intrinsic = pose_encoding_to_extri_intri(pose_enc, images.shape[-2:])
+                extrinsic, intrinsic = encoding_to_camera(
+                    pose_enc, images.shape[-2:])
 
                 
-                depth_map, depth_conf = self.vggt_encoder.depth_head(aggregated_tokens_list, images, ps_idx)
+                depth_map, depth_conf = self.vggt_encoder.dense_head(
+                    aggregated_tokens_list, images, patch_token_start=ps_idx)
                 del aggregated_tokens_list
 
                 assert depth_map.shape[-1] == 1
@@ -433,18 +467,45 @@ class VGGTDet(Base3DDetector):
 
                 del point_map_by_unprojection_tensor
                 sampled_point_map_by_unprojection_tensor *= norm_scale_tensor
+                self._save_pred_pointclouds(
+                    sampled_point_map_by_unprojection_tensor,
+                    batch_data_samples)
 
                 if self.if_use_atten_fps:
                     return sampled_point_map_by_unprojection_tensor.detach(), atten_weights
                 else:
                     return sampled_point_map_by_unprojection_tensor.detach(), None
 
+    @torch.no_grad()
+    def _save_pred_pointclouds(self, point_clouds, batch_data_samples):
+        if not self.visualize_pred_pointcloud:
+            return
+        if (torch.distributed.is_available() and torch.distributed.is_initialized()
+                and torch.distributed.get_rank() != 0):
+            return
 
-    def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict, images, images_patch_attn):
+        self.pred_pointcloud_path.mkdir(parents=True, exist_ok=True)
+        for point_cloud, data_sample in zip(point_clouds, batch_data_samples):
+            image_path = data_sample.metainfo['img_path'][0]
+            scene_name = Path(image_path).parent.name
+            colors = torch.full(
+                (len(point_cloud), 3), 255, dtype=point_cloud.dtype,
+                device=point_cloud.device)
+            points_with_color = torch.cat([point_cloud, colors], dim=-1)
+            write_ply_rgb(
+                points_with_color.detach().cpu().numpy(),
+                str(self.pred_pointcloud_path / f'{scene_name}_omega_pred_points.ply'))
+
+
+    def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
+                         images, images_patch_attn, batch_data_samples):
 
         if self.use_multi_layers:
             x = []
-            for idx_layer, tokens in enumerate(vggt_token_list):
+            for tokens in vggt_token_list:
+                if tokens is None:
+                    continue
+                idx_layer = len(x)
                 tokens_permute = tokens.permute(0, 3, 1, 2).contiguous()  
                 patch_tokens = tokens_permute[:, :, :, ps_idx:]
                 # patch_tokens_list.append(patch_tokens)
@@ -487,7 +548,9 @@ class VGGTDet(Base3DDetector):
             box_features = self.decoder(tgt, x, query_pos=query_embed, pos=None)[0]
             batch_inputs_dict['query_xyz'] = query_xyz
         elif self.if_use_pred_pc_query:
-            pred_pc, atten_weights = self.pred_pc_from_vggt(vggt_token_list, ps_idx, images, batch_inputs_dict, images_patch_attn)
+            pred_pc, atten_weights = self.pred_pc_from_vggt(
+                vggt_token_list, ps_idx, images, batch_inputs_dict,
+                images_patch_attn, batch_data_samples)
             if self.if_add_noises:
                 pred_pc = self.add_normalized_noise_to_point_cloud(pred_pc, self.noise_level)
             if self.if_use_atten_fps:
@@ -539,9 +602,9 @@ class VGGTDet(Base3DDetector):
 
         if self.if_mix_precision:
             with torch.cuda.amp.autocast(dtype=vggt_dtype):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn) 
+                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn, batch_data_samples)
         else: 
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn, batch_data_samples)
 
         losses = self.bbox_head.loss(box_features, batch_data_samples, batch_inputs_dict, **kwargs) 
         return losses
@@ -556,9 +619,9 @@ class VGGTDet(Base3DDetector):
 
         if self.if_mix_precision:
             with torch.cuda.amp.autocast(dtype=vggt_dtype):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn, batch_data_samples)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn, batch_data_samples)
 
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
@@ -575,9 +638,9 @@ class VGGTDet(Base3DDetector):
 
         if self.if_mix_precision:
             with torch.cuda.amp.autocast(dtype=vggt_dtype):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn, batch_data_samples)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn)
+            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, images_patch_attn, batch_data_samples)
 
         if self.test_only_last_layer:
             box_features = [box_features[-1]]

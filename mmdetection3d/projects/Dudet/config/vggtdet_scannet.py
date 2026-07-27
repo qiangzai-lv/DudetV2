@@ -16,11 +16,11 @@ model = dict(
     type='VGGTDet',
     data_preprocessor=dict(
         type='VGGTDetDataPreprocessor',
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
+        mean=None,
+        std=None,
         bgr_to_rgb=True,
         pad_size_divisor=14,
-        pad_value=1.0),
+        pad_value=0.0),
     two_d_detector=dict(
         enabled=True,
         config="../mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py",
@@ -81,9 +81,12 @@ model = dict(
     if_use_pred_pc_query=True,
     if_use_atten_sample=False,
     atten_sample_ratio=10,
-    if_use_atten_fps=True,
+    if_use_atten_fps=False,
     lambda_dist=0.8,
-    if_task_query=True
+    if_task_query=True,
+    vggt_omega_checkpoint='/mnt/workspace/pretrain/VGGT-Omega/vggt_omega_1b_512.pt',
+    visualize_pred_pointcloud=True,
+    pred_pointcloud_path='vis_dir/pred_points'
     )
 
 dataset_type = 'MultiViewScanNetDataset'
@@ -111,7 +114,7 @@ backend_args = None
 
 train_collect_keys = [
     'img', 'gt_bboxes_3d', 'gt_labels_3d', 'lightpos', 'nerf_sizes', 'raydirs',
-    'gt_images',  'denorm_images',
+    'gt_images',
     'c2w', 'intrinsic', 'points', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
     ] # here add depth will load depth as input
 
@@ -121,7 +124,6 @@ test_collect_keys = [
     'nerf_sizes',
     'raydirs',
     'gt_images',
-    'denorm_images',
     'c2w', 'intrinsic', 'points', 'gt_bboxes_3d', 'gt_labels_3d', 'pose_matrix', 'axis_align_matrix', 'avg_distance'
 ]
 
@@ -148,12 +150,11 @@ train_pipeline = [
             dict(type='LoadImageFromFile', file_client_args=file_client_args),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
         margin=10,
         depth_range=[0.5, 5.5], # for what purpose?
         loading='gap',
         nerf_target_views=2,
+        normalize=False,
         tgt_transforms=[
             dict(type='LoadImageFromFile', file_client_args=file_client_args),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
@@ -185,12 +186,11 @@ test_pipeline = [
             dict(type='LoadImageFromFile', file_client_args=file_client_args),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),
         ],
-        mean=[123.675, 116.28, 103.53],
-        std=[58.395, 57.12, 57.375],
         margin=10,
         depth_range=[0.5, 5.5],
         loading='random',
         nerf_target_views=1,
+        normalize=False,
         tgt_transforms=[
             dict(type='LoadImageFromFile', file_client_args=file_client_args),
             dict(type='Resize', scale=(448, 448), keep_ratio=True, interpolation='bicubic'),

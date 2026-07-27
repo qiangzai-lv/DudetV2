@@ -232,7 +232,7 @@ class PackNeRFDetInputs(BaseTransform):
                     gt_depths = to_tensor(np.ascontiguousarray(gt_depths))
                 results['gt_depths'] = gt_depths
 
-            if isinstance(results['denorm_images'], list):
+            if isinstance(results.get('denorm_images'), list):
                 denorm_imgs = np.stack(results['denorm_images'], axis=0)
                 if denorm_imgs.flags.c_contiguous:
                     denorm_imgs = to_tensor(denorm_imgs).permute(

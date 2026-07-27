@@ -600,7 +600,8 @@ class MultiViewPipeline_Tgt(BaseTransform):
                  loading: str = 'random',
                  nerf_target_views: int = 0,
                  sample_freq: int = 3,
-                 tgt_transforms=None):
+                 tgt_transforms=None,
+                 normalize: bool = True):
         self.transforms = Compose(transforms)
         self.depth_transforms = Compose(transforms[1])
         self.n_images = n_images
@@ -612,6 +613,7 @@ class MultiViewPipeline_Tgt(BaseTransform):
         self.sample_freq = sample_freq
         self.nerf_target_views = nerf_target_views
         self.tgt_transforms = Compose(tgt_transforms)
+        self.normalize = normalize
 
     def transform(self, results: dict) -> dict:
         """Nerfdet transform function.
@@ -709,12 +711,12 @@ class MultiViewPipeline_Tgt(BaseTransform):
             src_img_paths.append(results['img_info'][i]['filename'])
             _results = self.transforms(_results) # load and resize.
             imgs.append(_results['img']) # after resize, image is (239, 320, 3)            
-            # normalize
-            for key in _results.get('img_fields', ['img']):
-                _results[key] = mmcv.imnormalize(_results[key], self.mean,
-                                                 self.std, True) # to_rgb=True
-            _results['img_norm_cfg'] = dict(
-                mean=self.mean, std=self.std, to_rgb=True)
+            if self.normalize:
+                for key in _results.get('img_fields', ['img']):
+                    _results[key] = mmcv.imnormalize(
+                        _results[key], self.mean, self.std, True)
+                _results['img_norm_cfg'] = dict(
+                    mean=self.mean, std=self.std, to_rgb=True)
             # pad
             for key in _results.get('img_fields', ['img']):
                 padded_img = mmcv.impad(_results[key], shape=size, pad_val=0)
@@ -736,10 +738,11 @@ class MultiViewPipeline_Tgt(BaseTransform):
                         _results['depth'], (aft_shape[1], aft_shape[0]))
                 depths.append(_results['depth'])
 
-            denorm_img = mmcv.imdenormalize(
-                _results['img'], self.mean, self.std, to_bgr=False).astype(
-                    np.uint8) / 255.0 # rgb!! 
-            denorm_imgs_list.append(denorm_img)
+            if self.normalize:
+                denorm_img = mmcv.imdenormalize(
+                    _results['img'], self.mean, self.std,
+                    to_bgr=False).astype(np.uint8) / 255.0
+                denorm_imgs_list.append(denorm_img)
             height, width = padded_img.shape[:2]
             extrinsics.append(results['lidar2img']['extrinsic'][i])
 
@@ -830,7 +833,8 @@ class MultiViewPipeline_Tgt(BaseTransform):
             results['gt_images'] = gt_images # bgr image, 255 normalized
             results['gt_depths'] = gt_depths
             results['nerf_sizes'] = nerf_sizes
-            results['denorm_images'] = denorm_imgs_list
+            if self.normalize:
+                results['denorm_images'] = denorm_imgs_list
             results['depth_range'] = np.array([self.depth_range])
 
         if len(depths) != 0:
