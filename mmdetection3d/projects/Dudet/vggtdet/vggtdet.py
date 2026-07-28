@@ -406,13 +406,20 @@ class VGGTDet(Base3DDetector):
                 view_bboxes.append(boxes_2d)
                 original_height, original_width = original_shape[:2]
                 for box_2d in boxes_2d:
-                    if (original_height <= 0 or original_width <= 0
-                            or not torch.isfinite(box_2d).all()):
+                    original_size = torch.as_tensor(
+                        [original_height, original_width], dtype=torch.float32,
+                        device=box_2d.device)
+                    normalized_box = box_2d.float() / original_size[[1, 0, 1, 0]]
+                    if not torch.isfinite(normalized_box).all():
                         continue
-                    x1 = max(int(torch.floor(box_2d[0] * width / original_width).item()), 0)
-                    y1 = max(int(torch.floor(box_2d[1] * height / original_height).item()), 0)
-                    x2 = min(int(torch.ceil(box_2d[2] * width / original_width).item()), width)
-                    y2 = min(int(torch.ceil(box_2d[3] * height / original_height).item()), height)
+                    normalized_box.clamp_(0, 1)
+                    scaled_box = normalized_box * torch.tensor(
+                        [width, height, width, height], dtype=torch.float32,
+                        device=box_2d.device)
+                    x1 = int(torch.floor(scaled_box[0]).item())
+                    y1 = int(torch.floor(scaled_box[1]).item())
+                    x2 = int(torch.ceil(scaled_box[2]).item())
+                    y2 = int(torch.ceil(scaled_box[3]).item())
                     if x2 <= x1 or y2 <= y1:
                         continue
                     crop_points = point_maps[
