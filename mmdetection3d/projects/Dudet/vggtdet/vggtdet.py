@@ -285,6 +285,7 @@ class VGGTDet(Base3DDetector):
         valid = corners_cam[..., 2] > 1e-5
         pixels = corners_cam @ intrinsic.T
         pixels = pixels[..., :2] / pixels[..., 2:3].clamp_min(1e-5)
+        valid &= torch.isfinite(pixels).all(dim=-1)
         height, width = image_shape[:2]
 
         bboxes = []
@@ -405,6 +406,9 @@ class VGGTDet(Base3DDetector):
                 view_bboxes.append(boxes_2d)
                 original_height, original_width = original_shape[:2]
                 for box_2d in boxes_2d:
+                    if (original_height <= 0 or original_width <= 0
+                            or not torch.isfinite(box_2d).all()):
+                        continue
                     x1 = max(int(torch.floor(box_2d[0] * width / original_width).item()), 0)
                     y1 = max(int(torch.floor(box_2d[1] * height / original_height).item()), 0)
                     x2 = min(int(torch.ceil(box_2d[2] * width / original_width).item()), width)
