@@ -30,15 +30,6 @@ model = dict(
         bgr_to_rgb=True,
         pad_size_divisor=14,
         pad_value=0.0),
-    two_d_detector=dict(
-        enabled=True,
-        config="../mmdetection/configs/mm_grounding_dino/grounding_dino_swin-l_pretrain_all.py",
-        checkpoint="/mnt/workspace/pretrain/grounding_dino_swin-l_pretrain_all-56d69e78.pth",
-        score_thr=0.1,
-        nms_iou_thr=0.6,
-        max_per_view=100,
-        inference_batch_size=4,
-        use_grounding_dino=True),
     decoder_cfg = dict( # the same with 3detr
         dec_dim=_token_dim_,
         dec_nhead=4,
@@ -90,11 +81,13 @@ model = dict(
     if_use_pred_pc_query=True,
     if_task_query=True,
     vggt_omega_checkpoint='/mnt/workspace/pretrain/VGGT-Omega/vggt_omega_1b_512.pt',
-    visualize_pred_pointcloud=False,
-    pred_pointcloud_path='vis_dir/pred_points',
-    query_3d_nms_iou_thr=0.4,
-    query_min_points=16,
-    keyframe_count=12
+    query_fps_stride=16,
+    query_fps_max_points=100000,
+    visualize_query_points=False,
+    query_visualization_path='vis_dir/query_points',
+    query_visualization_marker_size=0.05,
+    train_cfg=dict(),
+    test_cfg=dict(nms_pre=1000, iou_thr=.25, score_thr=.01)
     )
 
 dataset_type = 'MultiViewScanNetDataset'
