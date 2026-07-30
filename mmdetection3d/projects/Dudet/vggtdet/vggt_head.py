@@ -139,21 +139,53 @@ class VGGTDetHead(BaseModule):
             nn.init.constant_(center_head.layers[-1].bias, 0.)
         self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
 
-    def project_the_first_frame_back(self, x: Tensor, pose_matrix, axis_align_matrix):
-        batch_size, _, num_boxes = x.shape
-        pose_matrix = torch.stack(pose_matrix, dim=0).to(x.device, dtype=x.dtype)  # [16, 4, 4]
-        axis_align_matrix = torch.stack(axis_align_matrix, dim=0).to(x.device, dtype=x.dtype)
-        ones = torch.ones(batch_size, 1, num_boxes, device=x.device)  # [16, 1, 256]
-        x_homogeneous = torch.cat([x, ones], dim=1)  # [16, 4, 256]
+    def project_the_first_frame_back(self, x: Tensor, pose_matrix,
+                                     axis_align_matrix, vggt_extrinsics=None,
+                                     coordinate_scale=None):
+        batch_size, _, num_points = x.shape
+        # Camera-coordinate transforms must use one dtype. Keep this geometry
+        # path in FP32 even when the detector runs under BF16 autocast.
+        with torch.autocast(device_type=x.device.type, enabled=False):
+            x = x.float()
+            pose_matrix = torch.stack(pose_matrix, dim=0).to(
+                x.device, dtype=torch.float32)  # [B, 4, 4]
+            axis_align_matrix = torch.stack(axis_align_matrix, dim=0).to(
+                x.device, dtype=torch.float32)
+            if vggt_extrinsics is not None:
+                vggt_extrinsics = vggt_extrinsics.to(
+                    x.device, dtype=torch.float32)
+                first_view_w2c = vggt_extrinsics[:, 0]
+                if first_view_w2c.shape[-2:] == (3, 4):
+                    bottom_row = first_view_w2c.new_tensor(
+                        [0., 0., 0., 1.]).view(1, 1, 4).expand(
+                            batch_size, -1, -1)
+                    first_view_w2c = torch.cat(
+                        [first_view_w2c, bottom_row], dim=1)
+                if isinstance(coordinate_scale, (list, tuple)):
+                    coordinate_scale = torch.stack(coordinate_scale, dim=0)
+                coordinate_scale = coordinate_scale.to(
+                    x.device, dtype=torch.float32).reshape(batch_size, 1, 1)
+                x = x / coordinate_scale.clamp_min(1e-8)
+                x = torch.bmm(first_view_w2c, torch.cat([
+                    x,
+                    torch.ones(batch_size, 1, num_points, device=x.device,
+                               dtype=x.dtype)
+                ], dim=1))[:, :3] * coordinate_scale
 
-        x_global_homogeneous = torch.bmm(pose_matrix, x_homogeneous)  # [16, 4, 256]
-        x_global_homogeneous = torch.bmm(axis_align_matrix, x_global_homogeneous)
-        w = torch.clamp(x_global_homogeneous[:, 3:4, :], min=1e-8)
-        x_global = x_global_homogeneous[:, :3, :] / w
+            ones = torch.ones(
+                batch_size, 1, num_points, device=x.device, dtype=x.dtype)
+            x_homogeneous = torch.cat([x, ones], dim=1)  # [B, 4, Q]
+
+            x_global_homogeneous = torch.bmm(pose_matrix, x_homogeneous)
+            x_global_homogeneous = torch.bmm(
+                axis_align_matrix, x_global_homogeneous)
+            w = torch.clamp(x_global_homogeneous[:, 3:4, :], min=1e-8)
+            x_global = x_global_homogeneous[:, :3, :] / w
         return x_global
 
-    def _forward_single(self, x: Tensor, scale: Scale, query_xyz, pose_matrix,
-                        axis_align_matrix, avg_distance, center_head,
+    def _forward_single(self, x: Tensor, scale: Scale, query_xyz,
+                        vggt_extrinsics, pose_matrix, axis_align_matrix,
+                        avg_distance, center_head,
                         size_head, semcls_head, refined_query_xyz=None):
         """Forward pass per level.
 
@@ -166,7 +198,9 @@ class VGGTDetHead(BaseModule):
         """
         center_pred = refined_query_xyz.permute(0, 2, 1)
 
-        center_pred = self.project_the_first_frame_back(center_pred, pose_matrix, axis_align_matrix)
+        center_pred = self.project_the_first_frame_back(
+            center_pred, pose_matrix, axis_align_matrix, vggt_extrinsics,
+            avg_distance)
 
         return (center_pred, torch.exp(scale(size_head(x))), #/ avg_distance_tensor,
                 semcls_head(x)) # , self.objness_head(x)
@@ -186,6 +220,7 @@ class VGGTDetHead(BaseModule):
             return multi_apply(self._forward_single, x,
                                [self.scales[i] for i in layer_ids],
                                [batch_inputs_dict['query_xyz'] for _ in range(len(x))],
+                               [batch_inputs_dict['vggt_extrinsics'] for _ in range(len(x))],
                                [batch_inputs_dict['pose_matrix'] for _ in range(len(x))],
                                [batch_inputs_dict['axis_align_matrix'] for _ in range(len(x))],
                                [batch_inputs_dict['avg_distance'] for _ in range(len(x))],
@@ -196,6 +231,7 @@ class VGGTDetHead(BaseModule):
         else:
             return multi_apply(self._forward_single, x,
                                [self.scales[i] for i in layer_ids],
+                               [None for _ in range(len(x))],
                                [None for _ in range(len(x))],
                                [batch_inputs_dict['pose_matrix'] for _ in range(len(x))],
                                [batch_inputs_dict['axis_align_matrix'] for _ in range(len(x))],
@@ -238,8 +274,8 @@ class VGGTDetHead(BaseModule):
             batch_gt_instances_ignore.append(
                 data_sample.get('ignored_instances', None))
 
-        loss_inputs = outs + (batch_gt_instances_3d,
-                              batch_input_metas, batch_input_points, batch_gt_instances_ignore)
+        loss_inputs = outs + (batch_gt_instances_3d, batch_input_metas,
+                              batch_input_points, batch_gt_instances_ignore)
         losses = self.loss_by_feat(*loss_inputs)
         return losses
 
