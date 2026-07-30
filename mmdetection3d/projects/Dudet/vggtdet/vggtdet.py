@@ -396,7 +396,6 @@ class VGGTDet(Base3DDetector):
         query = self.geometry_queries.unsqueeze(0).expand(
             query_xyz.shape[0], -1, -1).to(dtype=feature_maps[0].dtype)
         batch_inputs_dict['query_xyz'] = query_xyz
-        batch_inputs_dict['vggt_extrinsics'] = extrinsics
         return self.geometry_decoder(
             query, feature_maps, query_xyz, extrinsics, intrinsics,
             coordinate_scale,
