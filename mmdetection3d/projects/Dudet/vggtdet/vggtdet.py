@@ -1,5 +1,4 @@
 import sys
-from numbers import Number
 from pathlib import Path
 from typing import List, Tuple, Union
 
@@ -11,11 +10,11 @@ from mmdet3d.registry import MODELS
 from mmdet3d.structures.det3d_data_sample import SampleList
 from mmdet3d.utils import ConfigType, OptConfigType
 from projects.Dudet.detr3_models.helpers import GenericMLP
+from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
 from projects.Dudet.detr3_models.utils.votenet_pc_util import write_ply_rgb
 from projects.Dudet.vggtdet.device import autocast, get_device
-from projects.Dudet.detr3_models.position_embedding import PositionEmbeddingCoordsSine
-from projects.Dudet.detr3_models.transformer import (TransformerDecoder, TransformerDecoder_Multilevel,
-                                                     TransformerDecoderLayer)
+from projects.Dudet.vggtdet.geometry_attention import GeometryAwareDeformableDecoder
+
 _VGGT_OMEGA_ROOT = Path(__file__).resolve().parents[3] / 'vggt-omega'
 if str(_VGGT_OMEGA_ROOT) not in sys.path:
     sys.path.insert(0, str(_VGGT_OMEGA_ROOT))
@@ -114,6 +113,7 @@ class VGGTDet(Base3DDetector):
             vggt_omega_checkpoint='/mnt/workspace/pretrain/VGGT-Omega/vggt_omega_1b_512.pt',
             query_fps_stride=16,
             query_fps_max_points=100000,
+            deformable_num_points=4,
             visualize_query_points=False,
             query_visualization_path='vis_dir/query_points',
             query_visualization_marker_size=0.05
@@ -134,7 +134,14 @@ class VGGTDet(Base3DDetector):
 
         self.vggt_encoder.eval()
 
-        self.decoder = build_decoder(decoder_cfg, if_multilevel=use_multi_layers)
+        self.geometry_decoder = GeometryAwareDeformableDecoder(
+            embed_dims=token_dim,
+            num_layers=decoder_cfg['dec_nlayers'],
+            num_heads=decoder_cfg['dec_nhead'],
+            feedforward_channels=decoder_cfg['dec_ffn_dim'],
+            num_feature_levels=4 if use_multi_layers else 1,
+            num_points=deformable_num_points,
+            dropout=decoder_cfg['dec_dropout'])
 
         if if_simpler_project:
             if use_multi_layers: 
@@ -189,17 +196,14 @@ class VGGTDet(Base3DDetector):
 
         # self.proj_norm = nn.LayerNorm(token_dim)
         self.num_queries = num_queries
+        self.geometry_queries = nn.Parameter(torch.empty(num_queries, token_dim))
+        nn.init.xavier_normal_(self.geometry_queries)
         self.if_learnable_query = if_learnable_query
 
         if if_learnable_query:
             self.queries = nn.Parameter(torch.Tensor(num_queries, token_dim))
             nn.init.xavier_normal_(self.queries)
-        ######### idea 2 ############
-        self.if_task_query = if_task_query
-        if if_task_query:
-            self.task_query = nn.Parameter(torch.Tensor(1, token_dim))
-            nn.init.xavier_normal_(self.task_query)
-        ######### idea 2 ############
+
         self.test_only_last_layer = test_only_last_layer
 
         self.if_use_gt_query = if_use_gt_query
@@ -248,64 +252,6 @@ class VGGTDet(Base3DDetector):
                 img = batch_inputs_dict['imgs'].float().div(255.0)
                 aggregated_tokens_list, ps_idx = self.vggt_encoder.aggregator(img)
                 return aggregated_tokens_list, ps_idx, img
-
-    @staticmethod
-    def _original_image_shape(data_sample, view_index):
-        image_shapes = data_sample.metainfo['ori_shape']
-        if isinstance(image_shapes, torch.Tensor):
-            image_shapes = image_shapes.tolist()
-        if len(image_shapes) > 0 and isinstance(image_shapes[0], Number):
-            return image_shapes
-        return image_shapes[view_index]
-
-    @staticmethod
-    def _project_gt_instances(data_sample, view_index, image_shape, device):
-        gt_instances = data_sample.gt_instances_3d
-        corners = gt_instances.bboxes_3d.corners.to(
-            device=device, dtype=torch.float32)
-        labels = gt_instances.labels_3d.to(device=device, dtype=torch.long)
-        if len(corners) == 0:
-            return None
-
-        lidar2img = data_sample.metainfo['lidar2img']
-        extrinsic = torch.as_tensor(
-            lidar2img['extrinsic'][view_index], dtype=torch.float32,
-            device=device)
-        intrinsics = torch.as_tensor(
-            lidar2img['intrinsic'], dtype=torch.float32, device=device)
-        intrinsic = intrinsics[view_index] if intrinsics.ndim == 3 else intrinsics
-        if intrinsic.shape == (3, 3):
-            intrinsic_4x4 = torch.eye(4, dtype=intrinsic.dtype, device=device)
-            intrinsic_4x4[:3, :3] = intrinsic
-            intrinsic = intrinsic_4x4
-
-        corners_hom = torch.cat(
-            [corners, torch.ones_like(corners[..., :1])], dim=-1)
-        corners_cam = corners_hom @ extrinsic.T
-        valid = corners_cam[..., 2] > 1e-5
-        pixels = corners_cam @ intrinsic.T
-        pixels = pixels[..., :2] / pixels[..., 2:3].clamp_min(1e-5)
-        valid &= torch.isfinite(pixels).all(dim=-1)
-        height, width = image_shape[:2]
-
-        bboxes = []
-        projected_labels = []
-        for box_pixels, box_valid, label in zip(pixels, valid, labels):
-            box_pixels = box_pixels[box_valid]
-            if len(box_pixels) == 0:
-                continue
-            xy_min = box_pixels.min(dim=0).values.clamp(min=0)
-            xy_max = box_pixels.max(dim=0).values
-            xy_max[0].clamp_(max=width - 1)
-            xy_max[1].clamp_(max=height - 1)
-            if (xy_max <= xy_min).any():
-                continue
-            bboxes.append(torch.cat([xy_min, xy_max]))
-            projected_labels.append(label)
-
-        if not bboxes:
-            return None
-        return torch.stack(bboxes), torch.stack(projected_labels)
 
     @staticmethod
     @torch.no_grad()
@@ -373,8 +319,8 @@ class VGGTDet(Base3DDetector):
                     f'{scene_name}_reconstruction_queries.ply'))
 
     @torch.no_grad()
-    def _build_gt_fps_queries(self, aggregated_tokens_list, ps_idx, images,
-                              batch_inputs_dict, batch_data_samples):
+    def _build_pred_pc_fps_queries(self, aggregated_tokens_list, ps_idx, images,
+                                   batch_inputs_dict, batch_data_samples):
         pose_enc = self.vggt_encoder.camera_head(
             aggregated_tokens_list, patch_token_start=ps_idx)
         extrinsic, intrinsic = encoding_to_camera(pose_enc, images.shape[-2:])
@@ -383,70 +329,14 @@ class VGGTDet(Base3DDetector):
         depth_map = depth_map.squeeze(-1)
         point_maps = unproject_depth_map_to_point_map_torch(
             depth_map, extrinsic, intrinsic)
-        batch_size, num_views, height, width, _ = point_maps.shape
+        batch_size = point_maps.shape[0]
         norm_scale = torch.stack(batch_inputs_dict['avg_distance'], dim=0)
         point_maps = point_maps * norm_scale.to(point_maps).view(
             batch_size, 1, 1, 1, 1)
 
         batch_queries = []
-        batch_projected_gt = []
         batch_reconstructed_points = []
-        for batch_index, data_sample in enumerate(batch_data_samples):
-            candidate_points = []
-            view_bboxes = []
-            for view_index in range(num_views):
-                original_shape = self._original_image_shape(
-                    data_sample, view_index)
-                projected_gt = self._project_gt_instances(
-                    data_sample, view_index, original_shape, point_maps.device)
-                if projected_gt is None:
-                    view_bboxes.append(None)
-                    continue
-                boxes_2d, _ = projected_gt
-                view_bboxes.append(boxes_2d)
-                original_height, original_width = original_shape[:2]
-                for box_2d in boxes_2d:
-                    original_size = torch.as_tensor(
-                        [original_height, original_width], dtype=torch.float32,
-                        device=box_2d.device)
-                    normalized_box = box_2d.float() / original_size[[1, 0, 1, 0]]
-                    if not torch.isfinite(normalized_box).all():
-                        continue
-                    normalized_box.clamp_(0, 1)
-                    scaled_box = normalized_box * torch.tensor(
-                        [width, height, width, height], dtype=torch.float32,
-                        device=box_2d.device)
-                    x1 = int(torch.floor(scaled_box[0]).item())
-                    y1 = int(torch.floor(scaled_box[1]).item())
-                    x2 = int(torch.ceil(scaled_box[2]).item())
-                    y2 = int(torch.ceil(scaled_box[3]).item())
-                    if x2 <= x1 or y2 <= y1:
-                        continue
-                    crop_points = point_maps[
-                        batch_index, view_index, y1:y2:self.query_fps_stride,
-                        x1:x2:self.query_fps_stride]
-                    crop_depth = depth_map[
-                        batch_index, view_index, y1:y2:self.query_fps_stride,
-                        x1:x2:self.query_fps_stride]
-                    valid = torch.isfinite(crop_points).all(dim=-1)
-                    valid &= crop_depth > 1e-5
-                    valid &= crop_depth <= self.depth_thres
-                    if valid.any():
-                        candidate_points.append(crop_points[valid])
-
-            if candidate_points:
-                candidate_points = torch.cat(candidate_points)
-            else:
-                fallback_points = point_maps[
-                    batch_index, :, ::self.query_fps_stride,
-                    ::self.query_fps_stride].reshape(-1, 3)
-                fallback_depth = depth_map[
-                    batch_index, :, ::self.query_fps_stride,
-                    ::self.query_fps_stride].reshape(-1)
-                valid = torch.isfinite(fallback_points).all(dim=-1)
-                valid &= fallback_depth > 1e-5
-                valid &= fallback_depth <= self.depth_thres
-                candidate_points = fallback_points[valid]
+        for batch_index in range(batch_size):
             reconstructed_points = point_maps[
                 batch_index, :, ::self.query_fps_stride,
                 ::self.query_fps_stride].reshape(-1, 3)
@@ -461,99 +351,57 @@ class VGGTDet(Base3DDetector):
                 step = (len(reconstructed_points) + self.query_fps_max_points - 1)
                 step //= self.query_fps_max_points
                 reconstructed_points = reconstructed_points[::step]
-            if len(candidate_points) > self.query_fps_max_points:
-                step = (len(candidate_points) + self.query_fps_max_points - 1)
-                step //= self.query_fps_max_points
-                candidate_points = candidate_points[::step]
             batch_queries.append(
-                self._farthest_point_sample(candidate_points, self.num_queries))
-            batch_projected_gt.append(view_bboxes)
+                self._farthest_point_sample(reconstructed_points, self.num_queries))
             batch_reconstructed_points.append(reconstructed_points)
 
-        batch_inputs_dict['view_2d_gt_bboxes'] = batch_projected_gt
         query_points = torch.stack(batch_queries)
         self._save_query_visualizations(
             batch_reconstructed_points, query_points, batch_data_samples)
-        return query_points
+        return query_points, extrinsic, intrinsic, norm_scale
 
     def _encode_query_centers(self, query_xyz):
         pos_embed = self.pos_embedding(query_xyz, input_range=None)
         return self.query_projection(pos_embed)
 
+    def _build_patch_feature_maps(self, vggt_token_list, ps_idx, image_shape):
+        patch_size = self.vggt_encoder.aggregator.patch_size
+        patch_height = image_shape[0] // patch_size
+        patch_width = image_shape[1] // patch_size
+        feature_maps = []
+        for tokens in vggt_token_list:
+            if tokens is None:
+                continue
+            level = len(feature_maps)
+            patch_tokens = tokens[:, :, ps_idx:, :].permute(0, 3, 1, 2)
+            projector = getattr(self, f'proj_feat_dim{level}', None)
+            if projector is None:
+                projector = self.proj_feat_dim
+            projected_tokens = projector(patch_tokens)
+            batch_size, channels, num_views, num_tokens = projected_tokens.shape
+            if num_tokens != patch_height * patch_width:
+                raise ValueError('VGGT patch tokens do not match the input image grid')
+            feature_maps.append(projected_tokens.permute(0, 2, 1, 3).reshape(
+                batch_size, num_views, channels, patch_height, patch_width))
+        return feature_maps
 
     def get_box_features(self, vggt_token_list, ps_idx, batch_inputs_dict,
                          images, batch_data_samples):
 
-        if self.use_multi_layers:
-            x = []
-            for tokens in vggt_token_list:
-                if tokens is None:
-                    continue
-                idx_layer = len(x)
-                tokens_permute = tokens.permute(0, 3, 1, 2).contiguous()  
-                patch_tokens = tokens_permute[:, :, :, ps_idx:]
-                # patch_tokens_list.append(patch_tokens)
-                if idx_layer == 0:
-                    patch_tokens_projected = self.proj_feat_dim0(patch_tokens)
-                elif idx_layer == 1:
-                    patch_tokens_projected = self.proj_feat_dim1(patch_tokens)
-                elif idx_layer == 2:
-                    patch_tokens_projected = self.proj_feat_dim2(patch_tokens)
-                elif idx_layer == 3:
-                    patch_tokens_projected = self.proj_feat_dim3(patch_tokens)
-                elif idx_layer == 4:
-                    patch_tokens_projected = self.proj_feat_dim4(patch_tokens)
-                # if not self.if_use_pred_pc_query:
-                del patch_tokens
+        query_xyz, extrinsics, intrinsics, coordinate_scale = self._build_pred_pc_fps_queries(
+            vggt_token_list, ps_idx, images, batch_inputs_dict,
+            batch_data_samples)
+        feature_maps = self._build_patch_feature_maps(
+            vggt_token_list, ps_idx, images.shape[-2:])
+        query = self.geometry_queries.unsqueeze(0).expand(
+            query_xyz.shape[0], -1, -1).to(dtype=feature_maps[0].dtype)
+        batch_inputs_dict['query_xyz'] = query_xyz
+        return self.geometry_decoder(
+            query, feature_maps, query_xyz, extrinsics, intrinsics,
+            coordinate_scale,
+            images.shape[-2:], self.pos_embedding, self.query_projection,
+            self.bbox_head.center_heads)
 
-                batch_size, feat_dim, im_num, token_num = patch_tokens_projected.shape
-                patch_tokens_projected = patch_tokens_projected.reshape(batch_size, feat_dim, -1)
-                patch_tokens_projected = patch_tokens_projected.permute(2, 0, 1).contiguous() 
-                x.append(patch_tokens_projected)
-
-            if not self.if_use_pred_pc_query:
-                del vggt_token_list
-            
-            
-        else:
-            tokens_last_layer = vggt_token_list[-1]
-            patch_tokens_last_layer = tokens_last_layer[:, :, ps_idx:, :]  
-            x = patch_tokens_last_layer.permute(0, 3, 1, 2).contiguous()
-            x = self.proj_feat_dim(x)
-            batch_size, feat_dim, im_num, token_num = x.shape
-            x = x.reshape(batch_size, feat_dim, -1)
-            x = x.permute(2, 0, 1).contiguous()
-
-        if self.if_use_gt_query:
-            query_xyz = torch.stack([
-                data_sample.gt_instances_3d.bboxes_3d.tensor[:, :3]
-                for data_sample in batch_data_samples
-            ])
-            query_embed = self._encode_query_centers(query_xyz)
-            query_embed = query_embed.permute(2, 0, 1) # query_embed: [256, 4, 1024]
-            tgt = torch.zeros((self.num_queries, batch_size, feat_dim), device=query_xyz.device)
-            box_features = self.decoder(tgt, x, query_pos=query_embed, pos=None)[0]
-            batch_inputs_dict['query_xyz'] = query_xyz
-        elif self.if_use_pred_pc_query:
-            query_xyz = self._build_gt_fps_queries(
-                vggt_token_list, ps_idx, images, batch_inputs_dict,
-                batch_data_samples)
-            query_embed = self._encode_query_centers(query_xyz)
-            query_embed = query_embed.permute(2, 0, 1) # query_embed: [256, 4, 1024]
-            tgt = torch.zeros((query_xyz.shape[1], batch_size, feat_dim), device=query_xyz.device)
-            ######### idea 2 ############
-            if self.if_task_query:
-                expanded_task_query = self.task_query.unsqueeze(1).expand(-1, batch_size, -1) 
-                tgt = torch.cat([tgt, expanded_task_query], dim=0)  # [num_queries+1, bs, feat_dim]
-            ######### idea 2 ############
-
-            box_features = self.decoder(tgt, x, query_pos=query_embed, pos=None, if_task_query=self.if_task_query)[0]
-            batch_inputs_dict['query_xyz'] = query_xyz
-        else:
-            tgt = self.queries.unsqueeze(1).expand(-1, batch_size, -1) # [num_queries, batch_size, token_dim]
-            box_features = self.decoder(tgt, x, query_pos=None, pos=None)[0]
-
-        return box_features
 
     def loss(self, batch_inputs_dict: dict, batch_data_samples: SampleList,
              **kwargs) -> Union[dict, list]:
@@ -562,11 +410,15 @@ class VGGTDet(Base3DDetector):
 
         if self.if_mix_precision:
             with autocast(device):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
+                box_features, refined_query_xyz = self.get_box_features(
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    batch_data_samples)
         else: 
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
+            box_features, refined_query_xyz = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
 
-        losses = self.bbox_head.loss(box_features, batch_data_samples, batch_inputs_dict, **kwargs) 
+        losses = self.bbox_head.loss(
+            box_features, batch_data_samples, batch_inputs_dict,
+            refined_query_xyz=refined_query_xyz, **kwargs)
         return losses
 
 
@@ -579,14 +431,23 @@ class VGGTDet(Base3DDetector):
 
         if self.if_mix_precision:
             with autocast(device):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
+                box_features, refined_query_xyz = self.get_box_features(
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    batch_data_samples)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
+            box_features, refined_query_xyz = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
 
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
+            refined_query_xyz = [refined_query_xyz[-1]] if refined_query_xyz else None
+            layer_ids = [self.bbox_head.n_levels - 1]
+        else:
+            layer_ids = None
 
-        results_list = self.bbox_head.predict(box_features, batch_data_samples, batch_inputs_dict, **kwargs)
+        results_list = self.bbox_head.predict(
+            box_features, batch_data_samples, batch_inputs_dict,
+            refined_query_xyz=refined_query_xyz, layer_ids=layer_ids,
+            **kwargs)
         predictions = self.add_pred_to_datasample(batch_data_samples,
                                                   results_list)
         return predictions
@@ -598,30 +459,20 @@ class VGGTDet(Base3DDetector):
 
         if self.if_mix_precision:
             with autocast(device):
-                box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
+                box_features, refined_query_xyz = self.get_box_features(
+                    vggt_token_list, ps_idx, batch_inputs_dict, img,
+                    batch_data_samples)
         else:
-            box_features = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
+            box_features, refined_query_xyz = self.get_box_features(vggt_token_list, ps_idx, batch_inputs_dict, img, batch_data_samples)
 
         if self.test_only_last_layer:
             box_features = [box_features[-1]]
+            refined_query_xyz = [refined_query_xyz[-1]] if refined_query_xyz else None
+            layer_ids = [self.bbox_head.n_levels - 1]
+        else:
+            layer_ids = None
 
-        results = self.bbox_head.forward(box_features, batch_inputs_dict)
+        results = self.bbox_head.forward(
+            box_features, batch_inputs_dict, batch_data_samples,
+            refined_query_xyz=refined_query_xyz, layer_ids=layer_ids)
         return results
-
-def build_decoder(args, if_multilevel=False):
-    decoder_layer = TransformerDecoderLayer(
-        d_model=args.dec_dim,
-        nhead=args.dec_nhead,
-        dim_feedforward=args.dec_ffn_dim,
-        dropout=args.dec_dropout,
-    )
-
-    if if_multilevel:
-         decoder = TransformerDecoder_Multilevel(
-            decoder_layer, num_layers=args.dec_nlayers, return_intermediate=True
-        )       
-    else:
-        decoder = TransformerDecoder(
-            decoder_layer, num_layers=args.dec_nlayers, return_intermediate=True
-        )
-    return decoder

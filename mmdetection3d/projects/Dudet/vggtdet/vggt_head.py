@@ -1,6 +1,7 @@
 # Copyright (c) OpenMMLab. All rights reserved.
 from functools import partial
 from typing import List, Tuple
+import copy
 
 import torch
 import torch.nn.functional as F
@@ -19,19 +20,6 @@ from mmdet3d.utils.typing_utils import (ConfigType, InstanceList,
                                         OptConfigType, OptInstanceList)
 from projects.Dudet.detr3_models.helpers import GenericMLP
 from projects.Dudet.detr3_models.utils.votenet_pc_util import write_ply_rgb, write_bbox
-
-
-@torch.no_grad()
-def get_points(n_voxels, voxel_size, origin):
-    points = torch.stack(
-        torch.meshgrid([
-            torch.arange(n_voxels[0]),  # 40 W width, x
-            torch.arange(n_voxels[1]),  # 40 D depth, y
-            torch.arange(n_voxels[2])  # 16 H Height, z
-        ]))
-    new_origin = origin - n_voxels / 2. * voxel_size
-    points = points * voxel_size.view(3, 1, 1, 1) + new_origin.view(3, 1, 1, 1)
-    return points
 
 
 @MODELS.register_module()
@@ -136,12 +124,19 @@ class VGGTDetHead(BaseModule):
         self.if_project_frist_frame_back = if_project_frist_frame_back
 
     def _init_layers(self, n_channels, n_reg_outs, n_classes, n_levels):
-        """Initialize neural network layers of the head."""
-        # self.conv_center = nn.Conv3d(n_channels, 1, 3, padding=1, bias=False)
 
-        self.center_head = self.mlp_func(output_dim=3)
-        self.size_head = self.mlp_func(output_dim=3)
-        self.semcls_head = self.mlp_func(output_dim=n_classes+1) # foreground categories
+        center_head = self.mlp_func(output_dim=3)
+        size_head = self.mlp_func(output_dim=3)
+        semcls_head = self.mlp_func(output_dim=n_classes + 1)
+        self.center_heads = nn.ModuleList(
+            [copy.deepcopy(center_head) for _ in range(n_levels)])
+        self.size_heads = nn.ModuleList(
+            [copy.deepcopy(size_head) for _ in range(n_levels)])
+        self.semcls_heads = nn.ModuleList(
+            [copy.deepcopy(semcls_head) for _ in range(n_levels)])
+        for center_head in self.center_heads:
+            nn.init.constant_(center_head.layers[-1].weight, 0.)
+            nn.init.constant_(center_head.layers[-1].bias, 0.)
         self.scales = nn.ModuleList([Scale(1.) for _ in range(n_levels)])
 
     def project_the_first_frame_back(self, x: Tensor, pose_matrix, axis_align_matrix):
@@ -157,7 +152,9 @@ class VGGTDetHead(BaseModule):
         x_global = x_global_homogeneous[:, :3, :] / w
         return x_global
 
-    def _forward_single(self, x: Tensor, scale: Scale, query_xyz, pose_matrix, axis_align_matrix, avg_distance):
+    def _forward_single(self, x: Tensor, scale: Scale, query_xyz, pose_matrix,
+                        axis_align_matrix, avg_distance, center_head,
+                        size_head, semcls_head, refined_query_xyz=None):
         """Forward pass per level.
 
         Args:
@@ -167,30 +164,49 @@ class VGGTDetHead(BaseModule):
         Returns:
             tuple[Tensor]: Centerness, bbox and classification predictions.
         """
-        if self.learn_center_diff:
-            query_xyz = query_xyz.permute(0, 2, 1)
-            if self.if_project_frist_frame_back:
-                center_pred = self.project_the_first_frame_back(self.center_head(x)+query_xyz, pose_matrix, axis_align_matrix)
-            else:
-                center_pred = self.center_head(x)+query_xyz
+        center_pred = refined_query_xyz.permute(0, 2, 1)
 
-        else:
-            if self.if_project_frist_frame_back:
-                center_pred = self.project_the_first_frame_back(self.center_head(x), pose_matrix, axis_align_matrix)
-            else:
-                center_pred = self.center_head(x)
+        center_pred = self.project_the_first_frame_back(center_pred, pose_matrix, axis_align_matrix)
 
-        return (center_pred, torch.exp(scale(self.size_head(x))), #/ avg_distance_tensor,
-                self.semcls_head(x)) # , self.objness_head(x)
+        return (center_pred, torch.exp(scale(size_head(x))), #/ avg_distance_tensor,
+                semcls_head(x)) # , self.objness_head(x)
 
-    def forward(self, x, batch_inputs_dict, batch_data_samples):
+    def forward(self, x, batch_inputs_dict, batch_data_samples,
+                refined_query_xyz=None, layer_ids=None):
+
+        if layer_ids is None:
+            layer_ids = list(range(len(x)))
+        if len(layer_ids) != len(x):
+            raise ValueError('Layer ids must match decoder outputs')
+        if refined_query_xyz is None:
+            refined_query_xyz = [None for _ in range(len(x))]
+        elif len(refined_query_xyz) != len(x):
+            raise ValueError('Refined references must match decoder outputs')
         if 'query_xyz' in batch_inputs_dict.keys():
-            return multi_apply(self._forward_single, x, self.scales, [batch_inputs_dict['query_xyz'] for _ in range(self.n_levels)], [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)], [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)], [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)]) 
+            return multi_apply(self._forward_single, x,
+                               [self.scales[i] for i in layer_ids],
+                               [batch_inputs_dict['query_xyz'] for _ in range(len(x))],
+                               [batch_inputs_dict['pose_matrix'] for _ in range(len(x))],
+                               [batch_inputs_dict['axis_align_matrix'] for _ in range(len(x))],
+                               [batch_inputs_dict['avg_distance'] for _ in range(len(x))],
+                               [self.center_heads[i] for i in layer_ids],
+                               [self.size_heads[i] for i in layer_ids],
+                               [self.semcls_heads[i] for i in layer_ids],
+                               refined_query_xyz)
         else:
-            return multi_apply(self._forward_single, x, self.scales, [None for _ in range(self.n_levels)], [batch_inputs_dict['pose_matrix'] for _ in range(self.n_levels)], [batch_inputs_dict['axis_align_matrix'] for _ in range(self.n_levels)], [batch_inputs_dict['avg_distance'] for _ in range(self.n_levels)]) 
+            return multi_apply(self._forward_single, x,
+                               [self.scales[i] for i in layer_ids],
+                               [None for _ in range(len(x))],
+                               [batch_inputs_dict['pose_matrix'] for _ in range(len(x))],
+                               [batch_inputs_dict['axis_align_matrix'] for _ in range(len(x))],
+                               [batch_inputs_dict['avg_distance'] for _ in range(len(x))],
+                               [self.center_heads[i] for i in layer_ids],
+                               [self.size_heads[i] for i in layer_ids],
+                               [self.semcls_heads[i] for i in layer_ids],
+                               refined_query_xyz)
 
-    def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList, batch_inputs_dict: dict,
-             **kwargs) -> dict:
+    def loss(self, x: Tuple[Tensor], batch_data_samples: SampleList,
+             batch_inputs_dict: dict, refined_query_xyz=None, **kwargs) -> dict:
         """Perform forward propagation and loss calculation of the detection
         head on the features of the upstream network.
 
@@ -205,7 +221,7 @@ class VGGTDetHead(BaseModule):
             dict: A dictionary of loss components.
         """
         # valid_pred = x[-1]
-        outs = self(x, batch_inputs_dict, batch_data_samples) # x len: 8, every tensor shape: [bs, feat_dim, num_queries]
+        outs = self(x, batch_inputs_dict, batch_data_samples, refined_query_xyz)
 
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -266,28 +282,34 @@ class VGGTDetHead(BaseModule):
         Returns:
             dict: Centerness, bbox, and classification loss values.
         """
-        # valid_preds = self._upsample_valid_preds(valid_pred, center_preds)
-        center_losses, size_losses, cls_losses, objness_losses, giou_losses = [], [], [], [], []
-        for i in range(len(batch_input_metas)):
-            center_loss, size_loss, cls_loss, giou_loss = self._loss_by_feat_single(
-                center_preds=[x[i] for x in center_preds],
-                size_preds=[x[i] for x in size_preds],
-                cls_preds=[x[i] for x in cls_preds],
-                input_meta=batch_input_metas[i],
-                gt_bboxes=batch_gt_instances_3d[i].bboxes_3d,
-                gt_labels=batch_gt_instances_3d[i].labels_3d,
-                input_points=batch_input_points[i])
-            center_losses.append(center_loss)
-            size_losses.append(size_loss)
-            cls_losses.append(cls_loss)
-            giou_losses.append(giou_loss)
+        losses_by_layer = []
+        for layer_id in range(len(center_preds)):
+            center_losses, size_losses, cls_losses, giou_losses = [], [], [], []
+            for batch_id in range(len(batch_input_metas)):
+                center_loss, size_loss, cls_loss, giou_loss = \
+                    self._loss_by_feat_single(
+                        center_preds=[center_preds[layer_id][batch_id]],
+                        size_preds=[size_preds[layer_id][batch_id]],
+                        cls_preds=[cls_preds[layer_id][batch_id]],
+                        input_meta=batch_input_metas[batch_id],
+                        gt_bboxes=batch_gt_instances_3d[batch_id].bboxes_3d,
+                        gt_labels=batch_gt_instances_3d[batch_id].labels_3d,
+                        input_points=batch_input_points[batch_id])
+                center_losses.append(center_loss)
+                size_losses.append(size_loss)
+                cls_losses.append(cls_loss)
+                giou_losses.append(giou_loss)
+            losses_by_layer.append(dict(
+                center_loss=torch.mean(torch.stack(center_losses)),
+                size_loss=torch.mean(torch.stack(size_losses)),
+                cls_loss=torch.mean(torch.stack(cls_losses)),
+                giou_loss=torch.mean(torch.stack(giou_losses))))
 
-        return dict(
-            center_loss=torch.mean(torch.stack(center_losses)),
-            size_loss=torch.mean(torch.stack(size_losses)),
-            cls_loss=torch.mean(torch.stack(cls_losses)),
-            giou_loss=torch.mean(torch.stack(giou_losses))
-            )
+        loss_dict = losses_by_layer[-1]
+        for layer_id, losses in enumerate(losses_by_layer[:-1]):
+            for name, loss in losses.items():
+                loss_dict[f'd{layer_id}.{name}'] = loss
+        return loss_dict
 
     def _loss_by_feat_single(self, center_preds, size_preds, cls_preds, #objness_preds,
                               input_meta, gt_bboxes, gt_labels, input_points):
@@ -355,7 +377,8 @@ class VGGTDetHead(BaseModule):
 
     def predict(self,
                 x: Tuple[Tensor],
-                batch_data_samples: SampleList, batch_inputs_dict, 
+                batch_data_samples: SampleList, batch_inputs_dict,
+                refined_query_xyz=None, layer_ids=None,
                 rescale: bool = False) -> InstanceList:
         """Perform forward propagation of the 3D detection head and predict
         detection results on the features of the upstream network.
@@ -386,7 +409,9 @@ class VGGTDetHead(BaseModule):
         batch_input_metas = [
             data_samples.metainfo for data_samples in batch_data_samples
         ]
-        outs = self(x, batch_inputs_dict, batch_data_samples)
+        outs = self(
+            x, batch_inputs_dict, batch_data_samples, refined_query_xyz,
+            layer_ids)
         predictions = self.predict_by_feat(
             *outs,
             batch_input_metas=batch_input_metas,
@@ -413,7 +438,6 @@ class VGGTDetHead(BaseModule):
             list[tuple[Tensor]]: Predicted bboxes, scores, and labels for
                 all scenes.
         """
-        # valid_preds = self._upsample_valid_preds(valid_pred, center_preds)
         results = []
         if 'points' in batch_inputs_dict.keys():
             batch_input_points = batch_inputs_dict['points']
@@ -504,7 +528,6 @@ class VGGTDetHead(BaseModule):
         return results
 
 
-
     def find_max_iou_from_center_size_boxes(self, boxes1, boxes2):
         boxes1_tp = self._center_size_pred_to_bbox(boxes1[:, :3], boxes1[:, 3:6])
         boxes2_tp = self._center_size_pred_to_bbox(boxes2[:, :3], boxes2[:, 3:6])
@@ -514,37 +537,6 @@ class VGGTDetHead(BaseModule):
         assert max_giou <= 1 and  max_giou >= -1
         return max_giou, max_gt_box_idx, max_pred_box_idx
 
-
-
-    @staticmethod
-    def _upsample_valid_preds(valid_pred, features):
-        """Upsample valid mask predictions.
-
-        Args:
-            valid_pred (Tensor): Valid mask prediction.
-            features (Tensor): Feature tensor.
-
-        Returns:
-            tuple[Tensor]: Upsampled valid masks for all feature levels.
-        """
-        return [
-            nn.Upsample(size=x.shape[-3:],
-                        mode='trilinear')(valid_pred).round().bool()
-            for x in features
-        ]
-
-    @torch.no_grad()
-    def _get_points(self, featmap_sizes, origin, device):
-        mlvl_points = []
-        tmp_voxel_size = [.16, .16, .2]
-        for i, featmap_size in enumerate(featmap_sizes):
-            mlvl_points.append(
-                get_points(
-                    n_voxels=torch.tensor(featmap_size),
-                    voxel_size=torch.tensor(tmp_voxel_size) * (2**i),
-                    origin=torch.tensor(origin)).reshape(3, -1).transpose(
-                        0, 1).to(device))
-        return mlvl_points
 
     def _bbox_pred_to_bbox(self, points, bbox_pred):
         return torch.stack([
@@ -826,9 +818,6 @@ class UnifiedMatcherMoreThanOne(nn.Module):
             centers[:, 1] + sizes[:, 1]/2.0, centers[:, 2] + sizes[:, 2]/2.0
         ], -1)
     
-
-
-
 
 
 

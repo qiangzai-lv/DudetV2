@@ -79,7 +79,8 @@ model = dict(
     use_multi_layers=True,
     if_simpler_project=True,
     if_use_pred_pc_query=True,
-    if_task_query=True,
+    if_task_query=False,
+    deformable_num_points=4,
     vggt_omega_checkpoint='/mnt/workspace/pretrain/VGGT-Omega/vggt_omega_1b_512.pt',
     query_fps_stride=16,
     query_fps_max_points=100000,
@@ -248,7 +249,6 @@ train_cfg = dict(type='EpochBasedTrainLoop', max_epochs=_max_epoch, val_interval
 test_cfg = dict()
 val_cfg = dict()
 
-find_unused_parameters = False
 
 optim_wrapper = dict(
     type='OptimWrapper',
@@ -284,3 +284,5 @@ default_hooks = dict(
 vis_backends = [dict(type='LocalVisBackend')]
 visualizer = dict(
     type='Det3DLocalVisualizer', vis_backends=vis_backends, name='visualizer')
+
+find_unused_parameters=True
